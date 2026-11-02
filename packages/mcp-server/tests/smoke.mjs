@@ -19,7 +19,7 @@ assert.ok(contextRoot, "smoke state is missing design nodes");
 const contextNodeIds = [contextRoot.id, ...(contextRoot.children ?? [])];
 const tempDirectory = await mkdtemp(join(tmpdir(), "lake-mcp-smoke-"));
 const tempStatePath = join(tempDirectory, "state.json");
-await writeFile(tempStatePath, JSON.stringify({ ...state, contexts: [{ id: "context:smoke", documentId, documentSyncedAt: document.syncedAt, nodeIds: contextNodeIds, createdAt: new Date(0).toISOString(), label: "Smoke context" }] }));
+await writeFile(tempStatePath, JSON.stringify({ ...state, currentDocumentId: documentId, currentNodeId: contextRoot.id, contexts: [{ id: "context:smoke", documentId, documentSyncedAt: document.syncedAt, nodeIds: contextNodeIds, createdAt: new Date(0).toISOString(), label: "Smoke context" }] }));
 
 const child = spawn(process.execPath, ["--experimental-strip-types", "src/index.ts"], {
   cwd: packageRoot,
@@ -64,23 +64,57 @@ try {
 
   const resources = await request(8, "resources/list");
   assert.ok(resources.result.resources.some((resource) => resource.uri === "lake://implementation-context/current"));
+  assert.ok(resources.result.resources.some((resource) => resource.uri === "lake://design-selection/current"));
+  if (document.previewPath) {
+    assert.ok(resources.result.resources.some((resource) => resource.uri === "lake://design-preview/current"));
+  }
   assert.ok(resources.result.resources.some((resource) => resource.uri.includes(encodeURIComponent(documentId))));
 
   const templates = await request(9, "resources/templates/list");
   assert.ok(templates.result.resourceTemplates.some((template) => template.uriTemplate === "lake://design-document/{documentId}"));
+  assert.ok(templates.result.resourceTemplates.some((template) => template.uriTemplate === "lake://design-node/{documentId}/{nodeId}"));
 
   const currentResource = await request(10, "resources/read", { uri: "lake://implementation-context/current" });
   const currentResourcePayload = JSON.parse(currentResource.result.contents[0].text);
   assert.equal(currentResourcePayload.data.kind, "implementation-context");
+  if (document.previewPath) {
+    const previewResource = await request(11, "resources/read", { uri: "lake://design-preview/current" });
+    assert.equal(previewResource.result.contents[0].mimeType, "image/png");
+    assert.ok(previewResource.result.contents[0].blob.length > 100);
+  }
+
+  const currentSelectionResource = await request(13, "resources/read", { uri: "lake://design-selection/current" });
+  const currentSelectionPayload = JSON.parse(currentSelectionResource.result.contents[0].text);
+  assert.equal(currentSelectionPayload.data.kind, "current-selection");
+  assert.equal(currentSelectionPayload.data.nodeId, contextRoot.id);
+  assert.equal(currentSelectionPayload.data.selectionState, "selected");
+  assert.ok(currentSelectionPayload.data.selectionContext);
+  assert.ok(Array.isArray(currentSelectionPayload.data.selectionContext.nodes));
+
+  const boundedSelection = await request(14, "tools/call", {
+    name: "get_current_selection",
+    arguments: { maxDepth: 0, maxNodes: 1 }
+  });
+  const boundedSelectionPayload = JSON.parse(boundedSelection.result.content[0].text);
+  assert.equal(boundedSelectionPayload.data.selectionContext.limits.maxDepth, 0);
+  assert.equal(boundedSelectionPayload.data.selectionContext.limits.maxNodes, 1);
+  assert.equal(boundedSelectionPayload.data.selectionContext.nodes.length, 1);
+  assert.equal(boundedSelectionPayload.data.selectionContext.nodes[0].children.length, 0);
 
   const documentResource = await request(11, "resources/read", { uri: `lake://design-document/${encodeURIComponent(documentId)}` });
   const documentResourcePayload = JSON.parse(documentResource.result.contents[0].text);
   assert.equal(documentResourcePayload.data.kind, "implementation-context");
 
+  const nodeId = document.rootNodeIds[0];
+  const nodeResource = await request(12, "resources/read", { uri: `lake://design-node/${encodeURIComponent(documentId)}/${encodeURIComponent(nodeId)}` });
+  const nodeResourcePayload = JSON.parse(nodeResource.result.contents[0].text);
+  assert.equal(nodeResourcePayload.data.id, nodeId);
+
   const listed = await request(2, "tools/list");
   const toolNames = listed.result.tools.map((tool) => tool.name);
   assert.ok(toolNames.includes("get_design_specs"));
   assert.ok(toolNames.includes("get_current_implementation_context"));
+  assert.ok(toolNames.includes("get_current_selection"));
   assert.ok(toolNames.includes("get_design_context"));
   assert.ok(toolNames.includes("get_implementation_context"));
   assert.ok(toolNames.includes("list_design_contexts"));
@@ -92,12 +126,21 @@ try {
   assert.ok(specsPayload.data.platform === null || typeof specsPayload.data.platform === "object");
   assert.ok(Array.isArray(specsPayload.data.measurements));
 
+  if (document.previewPath) {
+    const previewTool = await request(32, "tools/call", { name: "get_design_preview", arguments: { documentId } });
+    assert.ok(previewTool.result.content?.some((item) => item.type === "image"));
+    const imageContent = previewTool.result.content.find((item) => item.type === "image");
+    assert.equal(imageContent.mimeType, "image/png");
+    assert.ok(imageContent.data.length > 100);
+  }
+
   const listedAssets = await request(31, "tools/call", { name: "list_assets", arguments: { documentId } });
   const listedAssetsPayload = JSON.parse(listedAssets.result.content[0].text);
   assert.ok(Array.isArray(listedAssetsPayload.data));
   for (const asset of listedAssetsPayload.data) {
     assert.ok(["available", "remote-only", "missing", "skipped", "review", "candidate-only"].includes(asset.availability));
     assert.ok(["confirmed", "candidate"].includes(asset.confidence));
+    assert.ok(Array.isArray(asset.qualityIssues));
   }
   assert.equal(listedAssetsPayload.source.syncVersion, document.syncVersion ?? 1);
 
@@ -167,6 +210,44 @@ try {
   assert.equal(currentImplementationPayload.data.kind, "implementation-context");
   assert.equal(currentImplementationPayload.data.mode, "document");
   assert.ok(currentImplementationPayload.source.url);
+
+  const alternateDocument = {
+    ...document,
+    id: `${document.id}:alternate`,
+    title: "Alternate design document",
+    sourceUrl: `${document.sourceUrl}#alternate`,
+    syncedAt: new Date(Date.parse(document.syncedAt) + 60_000).toISOString()
+  };
+  await writeFile(tempStatePath, JSON.stringify({
+    ...state,
+    documents: [document, alternateDocument],
+    currentDocumentId: document.id,
+    currentNodeId: contextRoot.id
+  }));
+  const currentDocumentImplementation = await request(56, "tools/call", {
+    name: "get_current_implementation_context",
+    arguments: {}
+  });
+  const currentDocumentImplementationPayload = JSON.parse(currentDocumentImplementation.result.content[0].text);
+  assert.equal(currentDocumentImplementationPayload.source.url, document.sourceUrl);
+
+  const listedResources = await request(57, "resources/list");
+  const currentResourceEntry = listedResources.result.resources.find((resource) => resource.uri === "lake://implementation-context/current");
+  assert.ok(currentResourceEntry.description.includes(document.title || document.id));
+  const currentResourceRead = await request(58, "resources/read", { uri: "lake://implementation-context/current" });
+  const currentResourceReadPayload = JSON.parse(currentResourceRead.result.contents[0].text);
+  assert.equal(currentResourceReadPayload.source.url, document.sourceUrl);
+
+  const currentSelection = await request(54, "tools/call", { name: "get_current_selection", arguments: {} });
+  const currentSelectionToolPayload = JSON.parse(currentSelection.result.content[0].text);
+  assert.equal(currentSelectionToolPayload.data.nodeId, contextRoot.id);
+  assert.equal(currentSelectionToolPayload.data.selectionState, "selected");
+
+  await writeFile(tempStatePath, JSON.stringify({ ...state, currentDocumentId: documentId, currentNodeId: "missing-node" }));
+  const staleSelection = await request(55, "tools/call", { name: "get_current_selection", arguments: {} });
+  const staleSelectionPayload = JSON.parse(staleSelection.result.content[0].text);
+  assert.equal(staleSelectionPayload.data.nodeId, null);
+  assert.equal(staleSelectionPayload.data.selectionState, "stale-node");
 
   const missingDocument = await request(6, "tools/call", { name: "get_design_specs", arguments: { documentId: "missing" } });
   assert.equal(missingDocument.error.code, -32000);

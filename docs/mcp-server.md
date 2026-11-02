@@ -28,7 +28,7 @@ create_design_context
 get_design_context（支持 maxDepth / maxNodes 限制）
 ```
 
-`get_current_implementation_context` 是日常调用入口，不需要 `documentId`，会自动选择最近一次同步的设计稿；需要局部模块时可以传 `contextId`。底层 `get_implementation_context` 仍支持显式传入 `documentId` 或 `contextId`。响应包含页面目标平台和单位、视口宽度/内容高度、滚动属性、节点层级、边界、文字、样式、资源可用性、可信度、截断状态和实现注意事项。
+`get_current_implementation_context` 是日常调用入口，不需要 `documentId`，会优先读取桌面应用保存的当前设计稿；如果当前文档不存在，才回退到最近一次同步的设计稿。需要局部模块时可以传 `contextId`。底层 `get_implementation_context` 仍支持显式传入 `documentId` 或 `contextId`。响应包含页面目标平台和单位、视口宽度/内容高度、滚动属性、节点层级、边界、文字、样式、资源可用性、可信度、截断状态和实现注意事项。
 
 这个接口是**框架无关的设计输入接口**，不是代码生成器。它不会指定或生成 React、Jetpack Compose、SwiftUI、UIKit、Android XML 或其他实现代码；AI 工具应根据 `target.platform`、`target.designUnit`、来源可信度以及用户的明确指令选择目标平台和框架。
 
@@ -61,6 +61,7 @@ MCP 不把Lake HTML、WebView DOM 或长图直接交给 Codex 作为设计图层
 - 桌面应用创建的 DesignContext 保存在同一个 `state.json`，MCP 优先读取持久化 context；`create_design_context` 仍保留当前进程内存模式，兼容直接通过 MCP 创建的临时 context。
 - `get_design_context` 和实现上下文默认按当前文档实际节点数读取，默认深度为 64 层；调用方可以显式传入 `maxNodes`/`maxDepth` 作为性能边界。显式限制触发时，返回同时包含扁平节点、树形节点、关联资源、缺失 node-id 和 `truncated` 状态，并标明 `truncation.nodeLimit`/`truncation.depthLimit`。
 - `get_current_implementation_context` 是 AI 工具的首选入口；底层 `get_implementation_context` 仍可用于显式指定 `documentId` 或 `contextId`。它把实现所需的页面目标、节点层级、样式、文字和资源引用整理为单次响应，并保留 `sourceRef`、`confidence`、`availability` 与 `warnings`，避免把候选数据误当成已确认设计规格。
+- 每份设计稿同步成功后，如果已保存官方整页预览图，MCP 会暴露 `lake://design-preview/current` 和 `lake://design-preview/{documentId}` 图片资源，并在实现上下文返回 `visualReference.uri`。AI 工具可以直接读取 PNG 作为视觉参照，再结合结构化节点实现页面，不需要用户手动截图；图片只用于视觉核对，不替代节点、尺寸、文字和样式数据。
 - Codex 的“导入 MCP”只负责写入 MCP 配置，不会复制应用本身。分发 `.app` 时应把 `Lake Catch.app` 放入 `/Applications`，然后重启 Codex；应用内的“添加到 Codex”会优先写入当前 `.app` 内置的 MCP Server 路径。
 - `target.platform` 只表示设计稿当前的平台选择（例如 `android`、`ios`、`web`），不表示应该使用哪一个 UI 框架；`target.designUnit` 只表示当前单位候选。`viewportSource`、`contentHeightSource` 和 `scrollableSource` 用于说明字段来自平台探针、根画板或推导结果。
 - `implementationGuidance` 只描述如何解释设计数据和可信度边界，不承担平台代码生成职责。HTML 预览脚本位于 `examples/ai-implementation/`，仅用于验证 MCP 数据，不是产品内置生成器。

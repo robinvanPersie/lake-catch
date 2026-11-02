@@ -9,6 +9,8 @@ export interface DesignRect {
   height: number;
 }
 
+export type DesignStyleValue = string | number | boolean | null | DesignStyleValue[] | { [key: string]: DesignStyleValue };
+
 export interface DesignNode {
   id: string;
   name: string;
@@ -19,7 +21,7 @@ export interface DesignNode {
   visible?: boolean;
   text?: string;
   assetUrl?: string;
-  style?: Record<string, string | number | boolean>;
+  style?: Record<string, DesignStyleValue>;
   sourceRef?: string;
   metadata?: {
     className?: string;
@@ -114,6 +116,13 @@ export interface DesignDocumentRevision {
   assetCount: number;
 }
 
+export interface DesignDocumentRevisionSnapshot extends DesignDocumentRevision {
+  rootNodeIds: string[];
+  nodes: Record<string, DesignNode>;
+  assets: Record<string, DesignAsset>;
+  measurementCandidates?: DesignMeasurementCandidate[];
+}
+
 export interface DesignDocument {
   id: string;
   provider: DesignProvider;
@@ -121,9 +130,13 @@ export interface DesignDocument {
   title?: string;
   projectName?: string;
   thumbnailPath?: string;
+  /** Official provider-rendered artboard image used only by the desktop preview. */
+  previewUrl?: string;
+  previewPath?: string;
   syncedAt: string;
   syncVersion: number;
   revisions?: DesignDocumentRevision[];
+  revisionSnapshots?: DesignDocumentRevisionSnapshot[];
   adapterVersion: string;
   capabilityReport: CapabilityReport;
   pageIds: string[];

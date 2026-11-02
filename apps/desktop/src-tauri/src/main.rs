@@ -1,3 +1,3 @@
 fn main() {
-    lanhu_bridge_lib::run();
+    lake_catch_lib::run();
 }

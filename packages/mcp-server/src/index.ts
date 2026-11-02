@@ -21,6 +21,8 @@ declare const process: {
 interface AppState {
   documents?: DesignDocument[];
   contexts?: DesignContext[];
+  currentDocumentId?: string | null;
+  currentNodeId?: string | null;
 }
 
 interface JsonRpcRequest {
@@ -45,6 +47,7 @@ interface ToolDefinition {
 
 const tools: ToolDefinition[] = [
   tool("list_design_documents", "列出本地已同步的设计文档。", {}),
+  tool("get_current_selection", "读取桌面应用当前选中的设计文档、节点和有上限的节点子树；没有选中节点时返回当前文档。", { maxDepth: numberProperty(), maxNodes: numberProperty() }),
   tool("get_design_document", "读取一份设计文档及其来源和能力可信度。", { documentId: stringProperty() }, ["documentId"]),
   tool("get_node_tree", "读取设计文档中的已确认节点树。", { documentId: stringProperty(), maxDepth: numberProperty() }, ["documentId"]),
   tool("get_node", "读取一个已确认设计节点。", { documentId: stringProperty(), nodeId: stringProperty() }, ["documentId", "nodeId"]),
@@ -53,6 +56,7 @@ const tools: ToolDefinition[] = [
   tool("get_implementation_context", "生成面向 AI 实现 UI 的紧凑设计上下文，包含平台、页面尺寸、节点规格、文字、样式、资源和不确定项；优先传入 contextId。", { documentId: stringProperty(), contextId: stringProperty(), maxDepth: numberProperty(), maxNodes: numberProperty() }),
   tool("list_assets", "列出设计文档中已确认的资源引用。", { documentId: stringProperty() }, ["documentId"]),
   tool("get_asset", "读取一项设计资源引用。", { documentId: stringProperty(), assetId: stringProperty() }, ["documentId", "assetId"]),
+  tool("get_design_preview", "读取当前或指定设计稿的官方整页视觉预览图；用于将结构化设计数据与原始视觉结果结合，避免人工截图。", { documentId: stringProperty() }),
   tool("list_design_contexts", "列出本地持久化的 DesignContext。", {}),
   tool("create_design_context", "在当前 MCP 进程中创建一个只读节点 context。", { documentId: stringProperty(), nodeIds: arrayProperty(), label: stringProperty() }, ["documentId", "nodeIds"]),
   tool("get_design_context", "读取本地持久化或当前 MCP 进程中的只读节点 context。", { contextId: stringProperty(), maxDepth: numberProperty(), maxNodes: numberProperty() }, ["contextId"])
@@ -333,22 +337,32 @@ async function persistedContexts(): Promise<DesignContext[]> {
 
 async function assetWithAvailability(asset: DesignAsset) {
   const confirmed = Boolean(asset.sourceUrl);
-  if (!confirmed) return { ...asset, availability: "candidate-only", confidence: "candidate" };
+  const qualityIssues: string[] = [];
+  if (!asset.sourceUrl) qualityIssues.push("missing-source-url");
+  if (!asset.density || asset.downloadPolicy === "review" || asset.downloadStatus === "review") {
+    qualityIssues.push("density-review");
+  }
+  if (asset.downloadStatus === "failed") qualityIssues.push("download-failed");
+  if (!confirmed) {
+    return { ...asset, availability: "candidate-only", confidence: "candidate", qualityIssues };
+  }
   if (asset.downloadPolicy === "skip-density-variant" || asset.downloadStatus === "skipped") {
-    return { ...asset, availability: "skipped", confidence: "confirmed" };
+    return { ...asset, availability: "skipped", confidence: "confirmed", qualityIssues };
   }
   if (asset.localPath) {
     try {
       await access(asset.localPath);
-      return { ...asset, availability: "available", confidence: "confirmed" };
+      return { ...asset, availability: "available", confidence: "confirmed", qualityIssues };
     } catch {
-      return { ...asset, availability: "remote-only", confidence: "confirmed", availabilityReason: "localPath 不存在或当前进程无法读取，但 sourceUrl 可用" };
+      qualityIssues.push("local-file-missing");
+      return { ...asset, availability: "remote-only", confidence: "confirmed", qualityIssues, availabilityReason: "localPath 不存在或当前进程无法读取，但 sourceUrl 可用" };
     }
   }
   return {
     ...asset,
     availability: "remote-only",
     confidence: "confirmed",
+    qualityIssues,
     availabilityReason: asset.downloadPolicy === "review" || asset.downloadStatus === "review"
       ? "sourceUrl 可用；资源密度待复核，尚未写入本地缓存"
       : "sourceUrl 可用，尚未写入本地缓存"
@@ -361,6 +375,15 @@ function documentSummary(document: DesignDocument) {
     provider: document.provider,
     title: document.title,
     sourceUrl: document.sourceUrl,
+    preview: document.previewPath ? {
+      uri: `lake://design-preview/${encodeURIComponent(document.id)}`,
+      available: true,
+      sourceUrl: document.previewUrl ?? null
+    } : {
+      uri: null,
+      available: false,
+      sourceUrl: document.previewUrl ?? null
+    },
     syncedAt: document.syncedAt,
     syncVersion: document.syncVersion ?? 1,
     revisionCount: document.revisions?.length ?? 1,
@@ -392,16 +415,108 @@ function envelope(document: DesignDocument, data: unknown) {
   };
 }
 
+function previewMimeType(path: string) {
+  return /\.jpe?g$/i.test(path) ? "image/jpeg" : /\.webp$/i.test(path) ? "image/webp" : "image/png";
+}
+
+async function previewResource(document: DesignDocument, uri: string) {
+  if (!document.previewPath) throw new Error("当前设计稿没有已保存的官方预览图，请先同步当前页面");
+  const bytes = await previewBytes(document);
+  return {
+    contents: [{
+      uri,
+      mimeType: previewMimeType(document.previewPath),
+      blob: Buffer.from(bytes).toString("base64")
+    }]
+  };
+}
+
+async function previewBytes(document: DesignDocument) {
+  if (!document.previewPath) throw new Error("当前设计稿没有已保存的官方预览图，请先同步当前页面");
+  const readBinary = readFile as unknown as (path: string) => Promise<Uint8Array>;
+  return readBinary(document.previewPath);
+}
+
+async function previewDocument(args: Record<string, unknown>) {
+  const allDocuments = await documents();
+  const state = await appState();
+  const current = allDocuments.find((item) => item.id === state.currentDocumentId);
+  return requireDocument(allDocuments, args.documentId ?? current?.id);
+}
+
 async function callTool(name: string, args: Record<string, unknown>) {
   const allDocuments = await documents();
   if (name === "list_design_documents") return { documents: allDocuments.map(documentSummary) };
+  if (name === "get_design_preview") {
+    const document = await previewDocument(args);
+    return {
+      documentId: document.id,
+      title: document.title ?? null,
+      uri: `lake://design-preview/${encodeURIComponent(document.id)}`,
+      available: Boolean(document.previewPath),
+      sourceUrl: document.previewUrl ?? null
+    };
+  }
+  if (name === "get_current_selection") {
+    const state = await appState();
+    const storedDocument = allDocuments.find((item) => item.id === state.currentDocumentId);
+    const document = storedDocument
+      ?? [...allDocuments].sort((left, right) => Date.parse(right.syncedAt) - Date.parse(left.syncedAt))[0];
+    if (!document) throw new Error("当前没有已同步的设计稿");
+    const hasStoredDocument = Boolean(storedDocument);
+    const hasStoredNodeId = hasStoredDocument && typeof state.currentNodeId === "string";
+    const nodeId = hasStoredNodeId ? state.currentNodeId : undefined;
+    const node = nodeId ? document.nodes[nodeId] : undefined;
+    const selectionState = !hasStoredDocument
+      ? "document-fallback"
+      : node
+        ? "selected"
+        : hasStoredNodeId
+          ? "stale-node"
+          : "document-only";
+    const maxDepth = boundedNumber(args.maxDepth, 8, 0, 64);
+    const maxNodes = boundedNumber(args.maxNodes, 200, 1, 5_000);
+    const selectedNodes: DesignNode[] = [];
+    const truncation = { nodeLimit: false, depthLimit: false };
+    const selectionTree = node
+      ? implementationTreeNode(document.nodes, node.id, 0, maxDepth, maxNodes, selectedNodes, truncation)
+      : null;
+    return envelope(document, {
+      kind: "current-selection",
+      documentId: document.id,
+      nodeId: node?.id ?? null,
+      selectionState,
+      document: documentSummary(document),
+      node: node ? { ...node, confidence: node.sourceRef?.startsWith("lake-json:") ? "confirmed" : "candidate" } : null,
+      selectionContext: node ? {
+        nodes: selectionTree ? [selectionTree] : [],
+        limits: { maxDepth, maxNodes },
+        summary: { nodeCount: selectedNodes.length },
+        truncation: {
+          nodeLimit: truncation.nodeLimit,
+          depthLimit: truncation.depthLimit,
+          truncated: truncation.nodeLimit || truncation.depthLimit
+        }
+      } : null,
+      note: selectionState === "selected"
+        ? "这是桌面应用当前选中的节点。"
+        : selectionState === "stale-node"
+          ? "桌面应用保存的节点已不在当前设计稿中；已返回当前设计稿，但没有返回失效节点。"
+          : selectionState === "document-fallback"
+            ? "桌面应用保存的当前文档不存在；已回退到最近同步的设计稿，不能视为用户当前选择。"
+            : "当前没有可恢复的选中节点，返回当前设计稿。"
+    });
+  }
   if (name === "get_current_implementation_context") {
+    const state = await appState();
+    const current = allDocuments.find((item) => item.id === state.currentDocumentId);
     const latest = [...allDocuments]
       .sort((left, right) => Date.parse(right.syncedAt) - Date.parse(left.syncedAt))[0];
-    if (!latest) throw new Error("当前没有已同步的设计稿");
+    const document = current ?? latest;
+    if (!document) throw new Error("当前没有已同步的设计稿");
     return callTool("get_implementation_context", {
       ...args,
-      documentId: latest.id
+      documentId: document.id
     });
   }
   if (name === "list_design_contexts") {
@@ -528,6 +643,14 @@ async function callTool(name: string, args: Record<string, unknown>) {
         artboardWidth: rootBounds?.width ?? null,
         artboardHeight: rootBounds?.height ?? null,
         confidence: platform?.confidence ?? (rootBounds ? "candidate" : "unknown")
+      },
+      visualReference: {
+        uri: document.previewPath ? `lake://design-preview/${encodeURIComponent(document.id)}` : null,
+        available: Boolean(document.previewPath),
+        sourceUrl: document.previewUrl ?? null,
+        guidance: document.previewPath
+          ? "读取该 MCP 图片资源作为原始视觉参照，再结合 nodes、bounds、text 和 style 实现页面；不要把图片本身当作页面实现。"
+          : "当前没有已保存的官方预览图，请先在桌面应用中同步当前页面。"
       },
       nodes,
       assets,
@@ -693,12 +816,21 @@ function implementationTreeNode(
   };
 }
 
-function result(value: unknown): JsonRpcResponse {
-  return { jsonrpc: "2.0", result: { content: [{ type: "text", text: JSON.stringify(value) }] } };
+function result(value: unknown, extraContent: unknown[] = []): JsonRpcResponse {
+  return {
+    jsonrpc: "2.0",
+    result: {
+      content: [
+        { type: "text", text: JSON.stringify(value) },
+        ...extraContent
+      ]
+    }
+  };
 }
 
 const resourceIndexUri = "lake://design-documents";
 const currentContextUri = "lake://implementation-context/current";
+const currentSelectionUri = "lake://design-selection/current";
 
 function documentResourceUri(documentId: string) {
   return `lake://design-document/${encodeURIComponent(documentId)}`;
@@ -715,17 +847,32 @@ function resourceForDocument(document: DesignDocument) {
 
 async function resourcesList() {
   const allDocuments = await documents();
+  const state = await appState();
+  const current = allDocuments.find((item) => item.id === state.currentDocumentId);
   const latest = [...allDocuments].sort((left, right) => Date.parse(right.syncedAt) - Date.parse(left.syncedAt))[0];
+  const selected = current ?? latest;
   return {
     resources: [
       {
         uri: currentContextUri,
         name: "当前设计稿实现上下文",
-        description: latest
-          ? `最近同步：${latest.title || latest.id}。适合 AI 读取并生成目标平台代码。`
-          : "最近一次同步的设计稿实现上下文。",
+        description: selected
+          ? `当前设计稿：${selected.title || selected.id}。适合 AI 读取并生成目标平台代码。`
+          : "当前设计稿实现上下文。",
         mimeType: "application/json"
       },
+      {
+        uri: currentSelectionUri,
+        name: "当前选中设计节点",
+        description: "读取桌面应用当前选中的设计文档和节点。",
+        mimeType: "application/json"
+      },
+      ...(selected?.previewPath ? [{
+        uri: "lake://design-preview/current",
+        name: "当前设计稿官方预览图",
+        description: "当前设计稿的官方整页视觉预览图，供 AI 结合结构化节点数据进行视觉核对。",
+        mimeType: previewMimeType(selected.previewPath)
+      }] : []),
       {
         uri: resourceIndexUri,
         name: "已同步设计稿索引",
@@ -745,6 +892,18 @@ function resourceTemplates() {
         name: "设计稿实现上下文",
         description: "按设计稿 ID 读取结构化实现上下文。",
         mimeType: "application/json"
+      },
+      {
+        uriTemplate: "lake://design-node/{documentId}/{nodeId}",
+        name: "设计节点",
+        description: "按设计稿 ID 和节点 ID 读取单个设计节点。",
+        mimeType: "application/json"
+      },
+      {
+        uriTemplate: "lake://design-preview/{documentId}",
+        name: "设计稿官方预览图",
+        description: "读取指定设计稿已保存的官方整页视觉预览图。",
+        mimeType: "image/png"
       }
     ]
   };
@@ -755,12 +914,31 @@ async function readResource(uri: string) {
   let value: unknown;
   if (uri === currentContextUri) {
     value = await callTool("get_current_implementation_context", {});
+  } else if (uri === currentSelectionUri) {
+    value = await callTool("get_current_selection", {});
   } else if (uri === resourceIndexUri) {
     value = { documents: allDocuments.map(documentSummary) };
+  } else if (uri === "lake://design-preview/current") {
+    const state = await appState();
+    const current = allDocuments.find((item) => item.id === state.currentDocumentId);
+    const selected = current ?? [...allDocuments].sort((left, right) => Date.parse(right.syncedAt) - Date.parse(left.syncedAt))[0];
+    if (!selected) throw new Error("当前没有已同步的设计稿");
+    return previewResource(selected, uri);
+  } else if (uri.startsWith("lake://design-preview/")) {
+    const documentId = decodeURIComponent(uri.slice("lake://design-preview/".length));
+    const document = requireDocument(allDocuments, documentId);
+    return previewResource(document, uri);
   } else if (uri.startsWith("lake://design-document/")) {
     const documentId = decodeURIComponent(uri.slice("lake://design-document/".length));
     const document = requireDocument(allDocuments, documentId);
     value = await callTool("get_implementation_context", { documentId });
+  } else if (uri.startsWith("lake://design-node/")) {
+    const parts = uri.slice("lake://design-node/".length).split("/");
+    if (parts.length !== 2 || !parts[0] || !parts[1]) throw new Error(`无效的设计节点资源：${uri}`);
+    const documentId = decodeURIComponent(parts[0]);
+    const nodeId = decodeURIComponent(parts[1]);
+    requireDocument(allDocuments, documentId);
+    value = await callTool("get_node", { documentId, nodeId });
   } else {
     throw new Error(`未找到资源：${uri}`);
   }
@@ -803,7 +981,21 @@ async function handle(request: JsonRpcRequest): Promise<JsonRpcResponse | null> 
   if (request.method === "tools/call") {
     const params = request.params ?? {};
     try {
-      const value = await callTool(String(params.name), (params.arguments ?? {}) as Record<string, unknown>);
+      const name = String(params.name);
+      const args = (params.arguments ?? {}) as Record<string, unknown>;
+      const value = await callTool(name, args);
+      if (name === "get_design_preview") {
+        const document = await previewDocument(args);
+        const bytes = await previewBytes(document);
+        return {
+          ...result(value, [{
+            type: "image",
+            data: Buffer.from(bytes).toString("base64"),
+            mimeType: previewMimeType(document.previewPath ?? "")
+          }]),
+          id: request.id
+        };
+      }
       return { ...result(value), id: request.id };
     } catch (error) {
       return { jsonrpc: "2.0", id: request.id, error: { code: -32000, message: error instanceof Error ? error.message : "工具调用失败" } };

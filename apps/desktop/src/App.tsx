@@ -4,6 +4,7 @@ import type { PageDiagnostics, PageStructuredDataProbe, SyncRecord } from "@lake
 import {
   createEmptyDesignDocument,
   type DesignDocument,
+  type DesignDocumentRevisionSnapshot,
   type DesignAsset,
   type DesignContext,
   type DesignMeasurementCandidate,
@@ -23,6 +24,8 @@ interface AppState {
   history: SyncRecord[];
   documents: DesignDocument[];
   contexts: DesignContext[];
+  currentDocumentId?: string | null;
+  currentNodeId?: string | null;
 }
 
 type RawSnapshotSvg = {
@@ -146,6 +149,9 @@ type LakeApiSyncResult = {
   team_id?: string;
   json_url?: string;
   json_size?: number;
+  raw_json_path?: string;
+  preview_url?: string;
+  preview_path?: string;
   root_keys: string[];
   layers: {
     id: string;
@@ -156,7 +162,7 @@ type LakeApiSyncResult = {
     text?: string;
     visible: boolean;
     depth: number;
-    style?: Record<string, string | number | boolean>;
+    style?: Record<string, import("@lake/design-model").DesignStyleValue>;
     asset_url?: string;
   }[];
   assets: {
@@ -180,6 +186,19 @@ type LakeApiSyncResult = {
 
 function formatTime(value: string) {
   return new Date(value).toLocaleString("zh-CN", { hour12: false });
+}
+
+function assetTargetDirectory(asset: DesignAsset) {
+  return asset.kind === "icon" ? "res/mipmap" : "res/drawable";
+}
+
+function assetQualityLabels(asset: DesignAsset) {
+  const labels: string[] = [];
+  if (!asset.sourceUrl) labels.push("缺少 URL");
+  if (!asset.density || asset.downloadPolicy === "review" || asset.downloadStatus === "review") labels.push("密度待复核");
+  if (asset.downloadStatus === "failed") labels.push("下载失败");
+  if (asset.localPath && asset.downloadStatus !== "downloaded" && asset.downloadStatus !== "cached" && asset.downloadStatus !== "skipped") labels.push("本地缓存待检查");
+  return labels;
 }
 
 async function copyText(value: string) {
@@ -304,6 +323,7 @@ export default function App() {
   const [activeView, setActiveView] = useState<"browser" | "preview">("browser");
   const [apiSyncResult, setApiSyncResult] = useState<LakeApiSyncResult | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | undefined>();
+  const [activeRevisionVersion, setActiveRevisionVersion] = useState<number | null>(null);
   const [diagnosticLog, setDiagnosticLog] = useState<DiagnosticLogEntry[]>([]);
   const [isConfiguringMcp, setIsConfiguringMcp] = useState(false);
 
@@ -376,20 +396,46 @@ export default function App() {
       const records = Array.isArray(state.history) ? state.history : [];
       const storedDocuments = Array.isArray(state.documents) ? state.documents : [];
       const storedContexts = Array.isArray(state.contexts) ? state.contexts : [];
+      const restoredDocumentId = typeof state.currentDocumentId === "string" && storedDocuments.some((item) => item.id === state?.currentDocumentId)
+        ? state.currentDocumentId
+        : records[0] ? documentIdFor(records[0]) : storedDocuments[0]?.id ?? null;
+      const restoredDocument = restoredDocumentId ? storedDocuments.find((item) => item.id === restoredDocumentId) : undefined;
+      const restoredNodeId = restoredDocument && typeof state.currentNodeId === "string" && restoredDocument.nodes[state.currentNodeId]
+        ? state.currentNodeId
+        : restoredDocument?.rootNodeIds[0] ?? null;
       setHistory(records);
       setResult(records[0] ?? null);
       setDocuments(storedDocuments);
       setContexts(storedContexts);
-      setDocumentId(records[0] ? documentIdFor(records[0]) : storedDocuments[0]?.id ?? null);
+      setDocumentId(restoredDocumentId);
+      setSelectedNodeId(restoredNodeId ?? undefined);
       if (records[0]) setStatus("已恢复上次同步结果");
       try {
-        await saveAppState({ history: records, documents: storedDocuments, contexts: storedContexts });
+        await saveAppState({ history: records, documents: storedDocuments, contexts: storedContexts, currentDocumentId: restoredDocumentId, currentNodeId: restoredNodeId });
       } catch {
         // The UI remains usable if the app data directory is temporarily unavailable.
       }
     })();
     return () => { cancelled = true; };
   }, []);
+
+  // A node id is only meaningful inside the document that owns it. Clear stale
+  // selections when switching documents, restoring old state, or deleting data.
+  useEffect(() => {
+    const currentDocument = documentId ? documents.find((item) => item.id === documentId) : undefined;
+    if (!currentDocument) {
+      if (selectedNodeId) setSelectedNodeId(undefined);
+      return;
+    }
+    const currentSnapshot = activeRevisionVersion
+      ? currentDocument.revisionSnapshots?.find((snapshot) => snapshot.version === activeRevisionVersion)
+      : undefined;
+    const nodes = currentSnapshot?.nodes ?? currentDocument.nodes;
+    const rootNodeIds = currentSnapshot?.rootNodeIds ?? currentDocument.rootNodeIds;
+    if (selectedNodeId && nodes[selectedNodeId]) return;
+    const fallbackNodeId = rootNodeIds.find((nodeId) => nodes[nodeId]?.sourceRef?.startsWith("lake-json:")) ?? rootNodeIds[0];
+    if (fallbackNodeId !== selectedNodeId) setSelectedNodeId(fallbackNodeId);
+  }, [activeRevisionVersion, documentId, documents, selectedNodeId]);
 
   const report = result?.report;
   const capabilityRows = useMemo(() => {
@@ -408,6 +454,7 @@ export default function App() {
     setApiSyncResult(null);
     setActiveView("browser");
     setSelectedNodeId(undefined);
+    setActiveRevisionVersion(null);
     let currentUrl = openedUrl.trim();
     let currentTitle = "Lake 设计稿（待真实页面验证）";
     let structuredDataProbe: PageStructuredDataProbe | undefined;
@@ -697,6 +744,7 @@ export default function App() {
       }
       if (apiSyncResult?.status === "ready") {
         report.notes.push(`设计 API 已完成：${apiSyncResult.stage}，JSON 大小 ${apiSyncResult.json_size ?? 0} bytes，提取 ${apiSyncResult.layers.length} 个图层，顶层字段 ${apiSyncResult.root_keys.join(", ") || "无"}。`);
+        report.notes.push(...apiSyncResult.notes);
         report.capabilities.pageIdentity = Boolean(apiSyncResult.project_id && apiSyncResult.image_id);
       } else if (apiSyncResult) {
         report.notes.push(`设计 API 阶段 ${apiSyncResult.stage} 未完成：${apiSyncResult.notes.join("；")}`);
@@ -775,6 +823,8 @@ export default function App() {
       });
       const previousDocument = documents.find((item) => item.id === document.id);
       document.syncVersion = (previousDocument?.syncVersion ?? 0) + 1;
+      document.previewUrl = apiSyncResult?.preview_url;
+      document.previewPath = apiSyncResult?.preview_path;
       document.nodes = nodes;
       document.rootNodeIds = rootNodeIds;
       for (const asset of apiSyncResult?.assets ?? []) {
@@ -846,14 +896,46 @@ export default function App() {
           assetCount: Object.keys(document.assets).length
         }
       ].slice(-10);
+      const previousRevisionSnapshots = [...(previousDocument?.revisionSnapshots ?? [])];
+      if (
+        previousDocument &&
+        !previousRevisionSnapshots.some((snapshot) => snapshot.version === previousDocument.syncVersion)
+      ) {
+        previousRevisionSnapshots.push({
+          version: previousDocument.syncVersion,
+          syncedAt: previousDocument.syncedAt,
+          sourceUrl: previousDocument.sourceUrl,
+          capabilityStatus: previousDocument.capabilityReport.status,
+          nodeCount: Object.keys(previousDocument.nodes).length,
+          assetCount: Object.keys(previousDocument.assets).length,
+          rootNodeIds: [...previousDocument.rootNodeIds],
+          nodes: structuredClone(previousDocument.nodes),
+          assets: structuredClone(previousDocument.assets),
+          measurementCandidates: structuredClone(previousDocument.measurementCandidates)
+        });
+      }
+      const currentRevisionSnapshot: DesignDocumentRevisionSnapshot = {
+        version: document.syncVersion,
+        syncedAt: document.syncedAt,
+        sourceUrl: document.sourceUrl,
+        capabilityStatus: document.capabilityReport.status,
+        nodeCount: Object.keys(document.nodes).length,
+        assetCount: Object.keys(document.assets).length,
+        rootNodeIds: [...document.rootNodeIds],
+        nodes: structuredClone(document.nodes),
+        assets: structuredClone(document.assets),
+        measurementCandidates: structuredClone(document.measurementCandidates)
+      };
+      document.revisionSnapshots = [...previousRevisionSnapshots, currentRevisionSnapshot].slice(-10);
       const nextDocuments = [document, ...documents.filter((item) => item.id !== document.id)].slice(0, 20);
       setDocuments(nextDocuments);
       const nextHistory = [record, ...history.filter((item) => item.report.pageUrl !== record.report.pageUrl)].slice(0, 10);
-      await saveAppState({ history: nextHistory, documents: nextDocuments, contexts });
+      await saveAppState({ history: nextHistory, documents: nextDocuments, contexts, currentDocumentId: document.id, currentNodeId: document.rootNodeIds[0] ?? null });
       setHistory(nextHistory);
       setResult(record);
       setDocumentId(document.id);
       setSelectedNodeId(document.rootNodeIds[0]);
+      setActiveRevisionVersion(null);
       setActiveView("preview");
       setStatus(apiSyncResult?.status === "ready"
         ? `同步完成：已下载设计 JSON（${apiSyncResult.json_size ?? 0} bytes）`
@@ -996,7 +1078,7 @@ export default function App() {
 
   function createCurrentContext() {
     if (!documentId || !selectedNodeId) return;
-    const document = documents.find((item) => item.id === documentId);
+    const document = viewedDocument;
     const selectedNode = document?.nodes[selectedNodeId];
     if (!document || !selectedNode || !selectedNode.sourceRef?.startsWith("lake-json:")) return;
 
@@ -1018,7 +1100,7 @@ export default function App() {
     };
     const nextContexts = [context, ...contexts.filter((item) => item.id !== context.id)].slice(0, 50);
     setContexts(nextContexts);
-    void saveAppState({ history, documents, contexts: nextContexts });
+    void saveAppState({ history, documents, contexts: nextContexts, currentDocumentId: documentId, currentNodeId: selectedNodeId ?? null });
     setStatus(`已创建上下文：${context.label}（${nodeIds.length} 个节点）`);
   }
 
@@ -1029,6 +1111,11 @@ export default function App() {
     } catch {
       setStatus(`复制${label}失败，请手动选择并复制`);
     }
+  }
+
+  function selectNode(nodeId: string | undefined, nextDocumentId = documentId) {
+    setSelectedNodeId(nodeId);
+    void saveAppState({ history, documents, contexts, currentDocumentId: nextDocumentId, currentNodeId: nodeId ?? null });
   }
 
   async function configureCodexMcp() {
@@ -1059,7 +1146,7 @@ export default function App() {
   function removeContext(contextId: string) {
     const nextContexts = contexts.filter((context) => context.id !== contextId);
     setContexts(nextContexts);
-    void saveAppState({ history, documents, contexts: nextContexts });
+    void saveAppState({ history, documents, contexts: nextContexts, currentDocumentId: documentId, currentNodeId: selectedNodeId ?? null });
     setStatus("已删除 DesignContext");
   }
 
@@ -1070,20 +1157,24 @@ export default function App() {
     if (!window.confirm(`确定删除本地设计文档“${label}”吗？同步历史不会被删除。`)) return;
     const nextDocuments = documents.filter((document) => document.id !== documentId);
     const nextContexts = contexts.filter((context) => context.documentId !== documentId);
-    void saveAppState({ history, documents: nextDocuments, contexts: nextContexts });
+    void saveAppState({ history, documents: nextDocuments, contexts: nextContexts, currentDocumentId: null, currentNodeId: null });
     setDocuments(nextDocuments);
     setContexts(nextContexts);
     setDocumentId(null);
+    setSelectedNodeId(undefined);
+    setActiveRevisionVersion(null);
     setStatus("已删除当前本地设计文档");
   }
 
   function clearDocuments() {
     if (documents.length === 0) return;
     if (!window.confirm(`确定清空 ${documents.length} 份本地设计文档吗？同步历史不会被删除。`)) return;
-    void saveAppState({ history, documents: [], contexts: [] });
+    void saveAppState({ history, documents: [], contexts: [], currentDocumentId: null, currentNodeId: null });
     setDocuments([]);
     setContexts([]);
     setDocumentId(null);
+    setSelectedNodeId(undefined);
+    setActiveRevisionVersion(null);
     setStatus("已清空本地设计文档");
   }
 
@@ -1196,6 +1287,12 @@ export default function App() {
   }
 
   const selectedDocument = documentId ? documents.find((item) => item.id === documentId) : undefined;
+  const viewedDocument = selectedDocument && activeRevisionVersion
+    ? (() => {
+        const snapshot = selectedDocument.revisionSnapshots?.find((item) => item.version === activeRevisionVersion);
+        return snapshot ? { ...selectedDocument, syncVersion: snapshot.version, syncedAt: snapshot.syncedAt, rootNodeIds: snapshot.rootNodeIds, nodes: snapshot.nodes, assets: snapshot.assets, measurementCandidates: snapshot.measurementCandidates } : selectedDocument;
+      })()
+    : selectedDocument;
   const platformContext = report?.diagnostics?.platformContext;
 
   return (
@@ -1252,11 +1349,11 @@ export default function App() {
           </div>
           {activeView === "preview" && report ? (
             <DesignPreview
-              document={selectedDocument}
+              document={viewedDocument}
               platform={platformContext}
-              measurementCandidates={selectedDocument?.measurementCandidates ?? []}
+              measurementCandidates={viewedDocument?.measurementCandidates ?? []}
               selectedNodeId={selectedNodeId}
-              onSelectNode={(nodeId) => { setSelectedNodeId(nodeId); setActiveView("preview"); }}
+              onSelectNode={(nodeId) => { selectNode(nodeId); setActiveView("preview"); }}
             />
           ) : (
             <div className="browser-content">
@@ -1365,7 +1462,7 @@ export default function App() {
                   <span>{documents.length} 份</span>
                 </div>
                 {documentId ? (() => {
-                  const document = documents.find((item) => item.id === documentId);
+                  const document = viewedDocument;
                   if (!document) return <p className="document-note">当前同步结果没有对应的本地设计文档。</p>;
                   const nodeCount = document ? Object.keys(document.nodes).length : 0;
                   const assetCount = document ? Object.keys(document.assets).length : 0;
@@ -1431,12 +1528,12 @@ export default function App() {
                       {revisionCount > 1 && (
                         <div className="revision-list" aria-label="同步版本">
                           {document.revisions?.slice().reverse().map((revision) => (
-                            <div className={`revision-list-item ${revision.version === syncVersion ? "is-current" : ""}`} key={`${revision.version}:${revision.syncedAt}`}>
+                            <button className={`revision-list-item ${revision.version === (activeRevisionVersion ?? syncVersion) ? "is-current" : ""}`} key={`${revision.version}:${revision.syncedAt}`} onClick={() => setActiveRevisionVersion(revision.version)}>
                               <strong>v{revision.version}</strong>
                               <span>{formatTime(revision.syncedAt)}</span>
                               <span>{revision.nodeCount} 节点 · {revision.assetCount} 资源</span>
-                              <em>{revision.version === syncVersion ? "当前" : revision.capabilityStatus}</em>
-                            </div>
+                              <em>{revision.version === (activeRevisionVersion ?? syncVersion) ? "当前查看" : revision.capabilityStatus}</em>
+                            </button>
                           ))}
                         </div>
                       )}
@@ -1445,8 +1542,9 @@ export default function App() {
                           {assetValues.slice(0, 24).map((asset) => (
                             <div className="asset-list-item" key={asset.id}>
                               <span className="asset-list-name" title={asset.name}>{asset.name}</span>
-                              <span>{asset.density ?? "密度未知"}</span>
-                              <span>{asset.downloadStatus === "downloaded" ? "已下载" : asset.downloadStatus === "cached" ? "缓存复用" : asset.downloadStatus === "skipped" ? "已跳过" : asset.downloadStatus === "review" ? "待确认" : asset.downloadStatus === "failed" ? "失败" : "待处理"}{(asset.referenceCount ?? 1) > 1 ? ` · ${asset.referenceCount}处引用` : ""}</span>
+                              <span>{asset.width && asset.height ? `${asset.width} × ${asset.height}` : "尺寸未知"} · {asset.density ?? "密度未知"}</span>
+                              <span>{assetTargetDirectory(asset)}</span>
+                              <span>{asset.downloadStatus === "downloaded" ? "已下载" : asset.downloadStatus === "cached" ? "缓存复用" : asset.downloadStatus === "skipped" ? "已跳过" : asset.downloadStatus === "review" ? "待确认" : asset.downloadStatus === "failed" ? "失败" : "待处理"}{assetQualityLabels(asset).length > 0 ? ` · ${assetQualityLabels(asset).join("、")}` : ""}{(asset.referenceCount ?? 1) > 1 ? ` · ${asset.referenceCount}处引用` : ""}</span>
                             </div>
                           ))}
                           {assetValues.length > 24 && <p className="document-note">仅显示前 24 个资源，完整资源仍可通过 MCP 查询。</p>}
@@ -1457,7 +1555,12 @@ export default function App() {
                         <button className="small-button danger" onClick={removeCurrentDocument}>删除当前文档</button>
                         <button className="small-button" onClick={clearDocuments} disabled={documents.length === 0}>清空本地文档</button>
                       </div>
-                      <LayerInspector document={document} selectedNodeId={selectedNodeId} onSelect={(nodeId) => { setSelectedNodeId(nodeId); setActiveView("preview"); }} />
+                      <LayerInspector
+                        document={document}
+                        selectedNodeId={selectedNodeId}
+                        onSelect={(nodeId) => { selectNode(nodeId); setActiveView("preview"); }}
+                        onCopyReference={(value, label) => void copyImplementationReference(value, label)}
+                      />
                       <section className="contexts-block" aria-label="DesignContext">
                         <div className="section-heading">
                           <h3>DesignContext</h3>
@@ -1501,7 +1604,7 @@ export default function App() {
               </details>
               <div className="history-block">
                 <h3>最近同步</h3>
-                {history.map((item) => <button className={`history-item ${item.request.requestId === result?.request.requestId ? "selected" : ""}`} key={item.request.requestId} onClick={() => { setResult(item); const nextDocumentId = documentIdFor(item); setDocumentId(nextDocumentId); setSelectedNodeId(documents.find((item) => item.id === nextDocumentId)?.rootNodeIds[0]); setOpenedUrl(item.report.pageUrl); setStatus("已切换到历史同步结果"); }}><span>{item.report.pageTitle}</span><time>{formatTime(item.savedAt)}</time></button>)}
+                {history.map((item) => <button className={`history-item ${item.request.requestId === result?.request.requestId ? "selected" : ""}`} key={item.request.requestId} onClick={() => { setResult(item); setActiveRevisionVersion(null); const nextDocumentId = documentIdFor(item); setDocumentId(nextDocumentId); const nextNodeId = documents.find((document) => document.id === nextDocumentId)?.rootNodeIds[0]; selectNode(nextNodeId, nextDocumentId); setOpenedUrl(item.report.pageUrl); setStatus("已切换到历史同步结果"); }}><span>{item.report.pageTitle}</span><time>{formatTime(item.savedAt)}</time></button>)}
               </div>
             </>
           ) : <p className="empty">点击“同步当前页面”生成第一份能力报告。</p>}

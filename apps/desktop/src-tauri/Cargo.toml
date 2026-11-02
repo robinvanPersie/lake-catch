@@ -1,22 +1,28 @@
 [package]
-name = "lanhu-bridge"
+name = "lake-catch"
 version = "0.1.0"
 description = "Lake Catch desktop shell"
 authors = ["Lake Catch"]
 edition = "2021"
 
 [lib]
-name = "lanhu_bridge_lib"
+name = "lake_catch_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["unstable"] }
+tauri = { version = "2", features = ["unstable", "protocol-asset"] }
+base64 = "0.23.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 sha2 = "0.10"
 url = "2"
 tokio = { version = "1", features = ["time"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSHTTPCookie", "NSUUID", "NSString"] }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["WKHTTPCookieStore", "WKWebsiteDataStore", "block2"] }

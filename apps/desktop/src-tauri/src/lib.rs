@@ -1,17 +1,25 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{webview::DownloadEvent, Manager, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
+
+#[cfg(target_os = "macos")]
+use block2::RcBlock;
+#[cfg(target_os = "macos")]
+use objc2_foundation::{MainThreadMarker, NSArray, NSHTTPCookie, NSUUID};
+#[cfg(target_os = "macos")]
+use objc2_web_kit::WKWebsiteDataStore;
 
 const LAKE_DATA_STORE_IDENTIFIER: [u8; 16] = [
     108, 97, 110, 104, 117, 45, 98, 114, 105, 100, 103, 101, 45, 118, 48, 49,
@@ -39,6 +47,9 @@ struct LakeApiSyncResult {
     team_id: Option<String>,
     json_url: Option<String>,
     json_size: Option<usize>,
+    raw_json_path: Option<String>,
+    preview_url: Option<String>,
+    preview_path: Option<String>,
     root_keys: Vec<String>,
     layers: Vec<LakeLayerSummary>,
     assets: Vec<LakeAssetSummary>,
@@ -91,6 +102,51 @@ struct LakeRoute {
     image_id: Option<String>,
     team_id: Option<String>,
     child: Option<String>,
+}
+
+#[derive(Default)]
+struct BrowserDownloadState {
+    pending: Mutex<HashMap<String, PathBuf>>,
+}
+
+#[cfg(target_os = "macos")]
+fn browser_cookie_header(app: &tauri::AppHandle) -> Result<String, String> {
+    let (sender, receiver) = mpsc::channel();
+    let data_store_identifier = LAKE_DATA_STORE_IDENTIFIER;
+    app.run_on_main_thread(move || {
+        let Some(main_thread) = MainThreadMarker::new() else {
+            let _ = sender.send(Err("无法获取 macOS 主线程标记".to_string()));
+            return;
+        };
+        let data_store = unsafe {
+            WKWebsiteDataStore::dataStoreForIdentifier(
+                &NSUUID::from_bytes(data_store_identifier),
+                main_thread,
+            )
+        };
+        let cookie_store = unsafe { data_store.httpCookieStore() };
+        let callback = RcBlock::new(
+            move |cookies: std::ptr::NonNull<NSArray<NSHTTPCookie>>| {
+                let header = unsafe { cookies.as_ref() }
+                    .to_vec()
+                    .iter()
+                    .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let _ = sender.send(Ok(header));
+            },
+        );
+        unsafe { cookie_store.getAllCookies(&callback) };
+    })
+    .map_err(|error| format!("读取 WebKit Cookie 失败：{error}"))?;
+    receiver
+        .recv_timeout(Duration::from_secs(3))
+        .map_err(|_| "读取 WebKit Cookie 超时".to_string())?
+}
+
+#[cfg(not(target_os = "macos"))]
+fn browser_cookie_header(_app: &tauri::AppHandle) -> Result<String, String> {
+    Ok(String::new())
 }
 
 fn lake_route(raw: &str) -> Result<LakeRoute, String> {
@@ -186,6 +242,98 @@ fn normalize_json_url(raw: &str) -> Result<Url, String> {
     Url::parse(&value).map_err(|_| "API 返回的 json_url 不是有效地址".to_string())
 }
 
+fn raw_design_json_file(app: &tauri::AppHandle, route: &LakeRoute) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("获取原始设计数据目录失败：{error}"))?
+        .join("raw-design-json");
+    fs::create_dir_all(&directory).map_err(|error| format!("创建原始设计数据目录失败：{error}"))?;
+    let safe = |value: Option<&str>, fallback: &str| {
+        value
+            .unwrap_or(fallback)
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    };
+    Ok(directory.join(format!(
+        "{}-{}.json",
+        safe(route.project_id.as_deref(), "project"),
+        safe(route.image_id.as_deref(), "image")
+    )))
+}
+
+fn preview_file(app: &tauri::AppHandle, route: &LakeRoute) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("获取预览图目录失败：{error}"))?
+        .join("preview-images");
+    fs::create_dir_all(&directory).map_err(|error| format!("创建预览图目录失败：{error}"))?;
+    let safe = |value: Option<&str>, fallback: &str| {
+        value
+            .unwrap_or(fallback)
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    };
+    Ok(directory.join(format!(
+        "{}-{}.png",
+        safe(route.project_id.as_deref(), "project"),
+        safe(route.image_id.as_deref(), "image")
+    )))
+}
+
+fn official_preview_url(value: &serde_json::Value) -> Option<String> {
+    fn walk(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::Object(object) => {
+                for key in [
+                    "cover_url",
+                    "coverUrl",
+                    "preview_url",
+                    "previewUrl",
+                    "image_url",
+                    "imageUrl",
+                    "url",
+                ] {
+                    let Some(candidate) = object.get(key).and_then(serde_json::Value::as_str)
+                    else {
+                        continue;
+                    };
+                    if candidate.starts_with("http://") || candidate.starts_with("https://") {
+                        let lower = candidate.to_ascii_lowercase();
+                        if candidate.contains("FigmaCover")
+                            || lower.contains(".png")
+                            || lower.contains(".jpg")
+                            || lower.contains(".jpeg")
+                            || lower.contains(".webp")
+                        {
+                            return Some(candidate.to_string());
+                        }
+                    }
+                }
+                object.values().find_map(walk)
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(walk),
+            _ => None,
+        }
+    }
+    walk(value)
+}
+
 fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
     let object = value.as_object()?;
     keys.iter().find_map(|key| {
@@ -247,24 +395,39 @@ fn layer_style(value: &serde_json::Value) -> Option<serde_json::Map<String, serd
         "textStyle",
         "fill",
         "fills",
+        "paint",
+        "paints",
         "stroke",
+        "strokes",
         "border",
+        "background",
+        "backgrounds",
+        "effect",
+        "effects",
+        "shadow",
+        "shadows",
+        "gradient",
+        "gradients",
     ] {
-        let Some(container) = object
-            .get(container_key)
-            .and_then(serde_json::Value::as_object)
-        else {
+        let Some(container) = object.get(container_key).filter(|item| !item.is_null()) else {
             continue;
         };
-        for (name, item) in container {
-            if style.contains_key(name) {
-                continue;
+        if let Some(container_object) = container.as_object() {
+            for (name, item) in container_object {
+                if style.contains_key(name) {
+                    continue;
+                }
+                if !item.is_null() {
+                    style.insert(name.clone(), item.clone());
+                }
             }
-            if item.is_string() || item.is_number() || item.is_boolean() {
-                style.insert(name.clone(), item.clone());
-            }
+        } else if !style.contains_key(container_key) {
+            // Paints and effects are commonly arrays. Preserve the complete
+            // value so the renderer can inspect gradients, alpha and shadows.
+            style.insert(container_key.to_string(), container.clone());
         }
     }
+
     (!style.is_empty()).then_some(style)
 }
 
@@ -584,6 +747,204 @@ async fn get_lake_session(app: tauri::AppHandle) -> Result<LakeSession, String> 
         value
     };
     serde_json::from_value(value).map_err(|_| "Lake 会话结果格式无效".to_string())
+}
+
+async fn fetch_lake_api_in_browser(
+    app: &tauri::AppHandle,
+    endpoint: &Url,
+) -> Result<Option<(u16, String)>, String> {
+    let Some(webview) = app.get_webview("lanhu-browser") else {
+        return Ok(None);
+    };
+    let request_key = format!(
+        "__lakeApiRequest_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+    let endpoint_literal = serde_json::to_string(endpoint.as_str())
+        .map_err(|error| format!("生成浏览器 API 请求失败：{error}"))?;
+    let script = format!(
+        r#"(() => {{
+          const key = {request_key:?};
+          const endpoint = {endpoint_literal};
+          window[key] = {{ pending: true }};
+          (async () => {{
+            try {{
+              const token = localStorage.getItem('token') || localStorage.getItem('access_token') || localStorage.getItem('accessToken') || '';
+              const headers = {{ 'Accept': 'application/json, text/plain, */*', 'X-Requested-With': 'XMLHttpRequest' }};
+              if (token) headers.token = token;
+              const response = await fetch(endpoint, {{ credentials: 'include', headers }});
+              window[key] = {{ status: response.status, body: await response.text() }};
+            }} catch (error) {{
+              window[key] = {{ error: String(error) }};
+            }}
+          }})();
+        }})()"#,
+        request_key = serde_json::to_string(&request_key)
+            .map_err(|error| format!("生成浏览器 API 请求标识失败：{error}"))?,
+        endpoint_literal = endpoint_literal,
+    );
+    webview
+        .eval(&script)
+        .map_err(|error| format!("启动浏览器 API 请求失败：{error}"))?;
+
+    for _ in 0..80 {
+        let (sender, receiver) = mpsc::channel();
+        let read_script = format!(
+            "JSON.stringify(window[{request_key:?}] || null)",
+            request_key = request_key
+        );
+        webview
+            .eval_with_callback(read_script, move |value| {
+                let _ = sender.send(value);
+            })
+            .map_err(|error| format!("读取浏览器 API 响应失败：{error}"))?;
+        let callback_value = tauri::async_runtime::spawn_blocking(move || {
+            receiver.recv_timeout(Duration::from_millis(250))
+        })
+        .await
+        .map_err(|error| format!("等待浏览器 API 响应任务失败：{error}"))?;
+        let Ok(callback_value) = callback_value else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(&callback_value)
+            .or_else(|_| {
+                serde_json::from_str(
+                    &serde_json::from_str::<String>(&callback_value).unwrap_or_default(),
+                )
+            })
+            .map_err(|error| format!("解析浏览器 API 响应失败：{error}"))?;
+        if value.get("pending").and_then(serde_json::Value::as_bool) == Some(true) {
+            continue;
+        }
+        if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+            return Err(format!("浏览器 API 请求失败：{error}"));
+        }
+        let status = value
+            .get("status")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "浏览器 API 响应缺少 HTTP 状态".to_string())?
+            as u16;
+        let body = value
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        return Ok(Some((status, body)));
+    }
+    Err("浏览器 API 请求超时".to_string())
+}
+
+async fn fetch_preview_in_browser(
+    app: &tauri::AppHandle,
+    preview_url: &str,
+    target_path: &PathBuf,
+) -> Result<Vec<u8>, String> {
+    let Some(webview) = app.get_webview("lanhu-browser") else {
+        return Err("Lake 浏览窗口尚未打开".to_string());
+    };
+
+    // WebKit's native download delegate is the same boundary used by
+    // DesignBridge. A page-level fetch() can be blocked by CORS even though
+    // the logged-in WebView can navigate to and download the image.
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("创建预览图目录失败：{error}"))?;
+    }
+    let _ = fs::remove_file(target_path);
+    {
+        let state = app.state::<BrowserDownloadState>();
+        let mut pending = state
+            .pending
+            .lock()
+            .map_err(|_| "浏览器下载状态不可用".to_string())?;
+        pending.insert(preview_url.to_string(), target_path.clone());
+    }
+
+    // Do not use an <a download> fallback here. Cross-origin image CDNs can
+    // ignore the download attribute and navigate the user's design page to
+    // the PNG URL. The in-page fetch below preserves the current URL.
+    let request_key = format!(
+        "__lakePreviewRequest_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+    let url_literal = serde_json::to_string(preview_url)
+        .map_err(|error| format!("生成浏览器预览图请求失败：{error}"))?;
+    let script = format!(
+        r#"(() => {{
+          const key = {request_key:?};
+          const url = {url_literal};
+          window[key] = {{ pending: true }};
+          (async () => {{
+            try {{
+              const response = await fetch(url, {{ credentials: 'include', mode: 'cors' }});
+              if (!response.ok) throw new Error(`HTTP ${{response.status}}`);
+              const blob = await response.blob();
+              const reader = new FileReader();
+              reader.onloadend = () => {{ window[key] = {{ data: reader.result }}; }};
+              reader.readAsDataURL(blob);
+            }} catch (error) {{
+              window[key] = {{ error: String(error) }};
+            }}
+          }})();
+        }})()"#,
+        request_key = serde_json::to_string(&request_key)
+            .map_err(|error| format!("生成浏览器预览图请求标识失败：{error}"))?,
+        url_literal = url_literal,
+    );
+    webview
+        .eval(&script)
+        .map_err(|error| format!("启动浏览器预览图请求失败：{error}"))?;
+
+    for _ in 0..120 {
+        let (sender, receiver) = mpsc::channel();
+        let read_script = format!(
+            "JSON.stringify(window[{request_key:?}] || null)",
+            request_key = request_key
+        );
+        webview
+            .eval_with_callback(read_script, move |value| {
+                let _ = sender.send(value);
+            })
+            .map_err(|error| format!("读取浏览器预览图响应失败：{error}"))?;
+        let callback_value = tauri::async_runtime::spawn_blocking(move || {
+            receiver.recv_timeout(Duration::from_millis(250))
+        })
+        .await
+        .map_err(|error| format!("等待浏览器预览图任务失败：{error}"))?;
+        let Ok(callback_value) = callback_value else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(&callback_value)
+            .or_else(|_| {
+                serde_json::from_str(
+                    &serde_json::from_str::<String>(&callback_value).unwrap_or_default(),
+                )
+            })
+            .map_err(|error| format!("解析浏览器预览图响应失败：{error}"))?;
+        if value.get("pending").and_then(serde_json::Value::as_bool) == Some(true) {
+            continue;
+        }
+        if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+            return Err(format!("浏览器预览图请求失败：{error}"));
+        }
+        let data_url = value
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "浏览器预览图响应缺少 data URL".to_string())?;
+        let encoded = data_url
+            .split_once(',')
+            .map(|(_, value)| value)
+            .ok_or_else(|| "浏览器预览图 data URL 格式无效".to_string())?;
+        return BASE64_STANDARD
+            .decode(encoded)
+            .map_err(|error| format!("解码浏览器预览图失败：{error}"));
+    }
+    Err("浏览器预览图请求超时".to_string())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -923,11 +1284,36 @@ async fn fetch_lake_design_data(
         break;
     }
     let response = response.ok_or_else(|| "api-requested 阶段失败".to_string())?;
-    let http_status = response.status().as_u16();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| format!("api-response-received 阶段失败：{error}"))?;
+    let native_http_status = response.status().as_u16();
+    let (http_status, body) = if native_http_status == 418 {
+        match fetch_lake_api_in_browser(&app, &endpoint).await {
+            Ok(Some((browser_status, browser_body))) => (browser_status, browser_body),
+            Ok(None) => (
+                native_http_status,
+                response
+                    .text()
+                    .await
+                    .map_err(|error| format!("api-response-received 阶段失败：{error}"))?,
+            ),
+            Err(error) => {
+                let native_body = response.text().await.map_err(|read_error| {
+                    format!("api-response-received 阶段失败：{read_error}")
+                })?;
+                return Err(format!(
+                    "api-response-received 阶段失败：HTTP 418；浏览器会话重试失败：{error}；服务端响应：{}",
+                    native_body.chars().take(240).collect::<String>()
+                ));
+            }
+        }
+    } else {
+        (
+            native_http_status,
+            response
+                .text()
+                .await
+                .map_err(|error| format!("api-response-received 阶段失败：{error}"))?,
+        )
+    };
     if http_status == 401 || http_status == 403 {
         return Err("credentials-read 阶段失败：当前登录态无权访问此设计稿".to_string());
     }
@@ -949,6 +1335,7 @@ async fn fetch_lake_design_data(
         }
     }
     let data = response_data(&value);
+    let preview_url = official_preview_url(data);
     let raw_json_url = json_url(data)
         .ok_or_else(|| "json-url-found 阶段失败：API 响应中没有 json_url".to_string())?;
     let json_endpoint = normalize_json_url(&raw_json_url)?;
@@ -972,6 +1359,95 @@ async fn fetch_lake_design_data(
         .bytes()
         .await
         .map_err(|error| format!("json-downloaded 阶段失败：{error}"))?;
+    let raw_json_path = raw_design_json_file(&app, &route)?;
+    fs::write(&raw_json_path, &json_body)
+        .map_err(|error| format!("保存原始设计 JSON 失败：{error}"))?;
+    let mut notes = vec!["API/设计 JSON 已确认，页面 DOM 仅作为诊断信息。".to_string()];
+    let mut preview_path = None;
+    if let Some(url) = preview_url.as_deref() {
+        let path = preview_file(&app, &route)?;
+        let browser_cookies = browser_cookie_header(&app).unwrap_or_default();
+        if !browser_cookies.is_empty() {
+            notes.push(format!(
+                "已从同一 WebKit 数据存储读取 {} 个 Cookie，用于官方预览图下载。",
+                browser_cookies.matches(';').count() + 1
+            ));
+        } else {
+            notes.push("未读取到 WebKit Cookie，官方预览图将仅使用页面可见会话重试。".to_string());
+        }
+        // The image CDN rejects bare native requests with 403. Keep the
+        // request shaped like the authenticated WebKit page request, just as
+        // the browser-based DesignBridge flow does.
+        let mut preview_request = client
+            .get(url)
+            .header(reqwest::header::ACCEPT, "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+            .header(reqwest::header::REFERER, &page_url)
+            .header(reqwest::header::ORIGIN, "https://lanhuapp.com");
+        if !browser_cookies.is_empty() {
+            preview_request = preview_request.header(reqwest::header::COOKIE, browser_cookies);
+        } else if let Some(cookies) = session
+            .cookies
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            preview_request = preview_request.header(reqwest::header::COOKIE, cookies);
+        }
+        match preview_request.send().await {
+            Ok(response) if response.status().is_success() => match response.bytes().await {
+                Ok(bytes) if !bytes.is_empty() => {
+                    if let Err(error) = fs::write(&path, bytes) {
+                        notes.push(format!("保存官方预览图失败：{error}"));
+                    } else {
+                        preview_path = Some(path.to_string_lossy().into_owned());
+                    }
+                }
+                Ok(_) => notes.push(format!("官方预览图为空：{url}")),
+                Err(error) => notes.push(format!("读取官方预览图失败：{error}")),
+            },
+            Ok(response) => {
+                let status = response.status();
+                notes.push(format!(
+                    "原生网络下载官方预览图失败：HTTP {status}，尝试已登录页面下载。"
+                ));
+                match fetch_preview_in_browser(&app, url, &path).await {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        if !path.exists() {
+                            if let Err(write_error) = fs::write(&path, bytes) {
+                                notes.push(format!("保存浏览器预览图失败：{write_error}"));
+                            }
+                        }
+                        if path.exists() {
+                            preview_path = Some(path.to_string_lossy().into_owned());
+                            notes.push("已通过已登录 Lake 页面缓存官方预览图。".to_string());
+                        }
+                    }
+                    Ok(_) => notes.push("浏览器返回的官方预览图为空".to_string()),
+                    Err(browser_error) => {
+                        notes.push(format!("浏览器下载官方预览图失败：{browser_error}"))
+                    }
+                }
+            }
+            Err(error) => {
+                notes.push(format!(
+                    "原生网络下载官方预览图失败，尝试已登录页面：{error}"
+                ));
+                match fetch_preview_in_browser(&app, url, &path).await {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        if let Err(write_error) = fs::write(&path, bytes) {
+                            notes.push(format!("保存浏览器预览图失败：{write_error}"));
+                        } else {
+                            preview_path = Some(path.to_string_lossy().into_owned());
+                            notes.push("已通过已登录 Lake 页面缓存官方预览图。".to_string());
+                        }
+                    }
+                    Ok(_) => notes.push("浏览器返回的官方预览图为空".to_string()),
+                    Err(browser_error) => {
+                        notes.push(format!("浏览器下载官方预览图失败：{browser_error}"))
+                    }
+                }
+            }
+        }
+    }
     let design: serde_json::Value = serde_json::from_slice(&json_body)
         .map_err(|_| "json-downloaded 阶段失败：下载内容不是 JSON".to_string())?;
     let root_keys = design
@@ -979,8 +1455,35 @@ async fn fetch_lake_design_data(
         .map(|object| object.keys().take(40).cloned().collect())
         .unwrap_or_default();
     let (layers, mut assets) = extract_layers(&design);
-    let mut notes = vec!["API/设计 JSON 已确认，页面 DOM 仅作为诊断信息。".to_string()];
     notes.push(format!("已从设计 JSON 提取 {} 个图层摘要。", layers.len()));
+    let style_keys = design
+        .as_object()
+        .map(|_| {
+            layers
+                .iter()
+                .flat_map(|layer| {
+                    layer
+                        .style
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|style| style.keys())
+                })
+                .cloned()
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    notes.push(format!(
+        "原始图层样式字段：{}。",
+        if style_keys.is_empty() {
+            "无".to_string()
+        } else {
+            style_keys.into_iter().collect::<Vec<_>>().join(", ")
+        }
+    ));
+    notes.push(format!(
+        "原始设计 JSON 已保存到应用数据目录：{}。",
+        raw_json_path.display()
+    ));
     let skipped = assets
         .iter()
         .filter(|asset| asset.download_policy == "skip-density-variant")
@@ -1017,6 +1520,9 @@ async fn fetch_lake_design_data(
         team_id: route.team_id,
         json_url: Some(json_endpoint.to_string()),
         json_size: Some(json_body.len()),
+        raw_json_path: Some(raw_json_path.to_string_lossy().into_owned()),
+        preview_url,
+        preview_path,
         root_keys,
         layers,
         assets,
@@ -1127,14 +1633,17 @@ fn mcp_connection_info(app: &tauri::AppHandle) -> Result<McpConnectionInfo, Stri
 }
 
 fn codex_mcp_block(info: &McpConnectionInfo) -> String {
-    let quote = |value: &str| format!(
-        "\"{}\"",
-        value.replace('\\', "\\\\").replace('"', "\\\"")
-    );
-    let args = info.args.iter().map(|arg| quote(arg)).collect::<Vec<_>>().join(", ");
+    let quote = |value: &str| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""));
+    let args = info
+        .args
+        .iter()
+        .map(|arg| quote(arg))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "[mcp_servers.lake]\ncommand = {}\nargs = [{}]\n",
-        quote(&info.command), args
+        quote(&info.command),
+        args
     )
 }
 
@@ -1335,14 +1844,15 @@ async fn get_lanhu_browser_url(app: tauri::AppHandle) -> Result<Option<String>, 
             let _ = sender.send(value);
         })
         .map_err(|error| error.to_string())?;
-    let payload = tauri::async_runtime::spawn_blocking(move || {
-        receiver.recv_timeout(Duration::from_secs(2))
-    })
-    .await
-    .map_err(|error| format!("读取 Lake 页面地址任务失败：{error}"))?
-    .map_err(|error| format!("读取 Lake 页面地址超时：{error}"))?;
+    let payload =
+        tauri::async_runtime::spawn_blocking(move || receiver.recv_timeout(Duration::from_secs(2)))
+            .await
+            .map_err(|error| format!("读取 Lake 页面地址任务失败：{error}"))?
+            .map_err(|error| format!("读取 Lake 页面地址超时：{error}"))?;
     let value: serde_json::Value = serde_json::from_str(&payload)
-        .or_else(|_| serde_json::from_str(&serde_json::from_str::<String>(&payload).unwrap_or_default()))
+        .or_else(|_| {
+            serde_json::from_str(&serde_json::from_str::<String>(&payload).unwrap_or_default())
+        })
         .map_err(|error| format!("解析 Lake 页面地址失败：{error}"))?;
     Ok(value.as_str().map(str::to_string))
 }
@@ -1350,36 +1860,59 @@ async fn get_lanhu_browser_url(app: tauri::AppHandle) -> Result<Option<String>, 
 fn validate_lake_url(raw: &str) -> Result<Url, String> {
     let parsed = Url::parse(raw).map_err(|_| "Lake 页面地址不是有效 URL".to_string())?;
     let host = parsed.host_str().unwrap_or_default();
-    if parsed.scheme() != "https"
-        || !(host == "lanhuapp.com" || host.ends_with(".lanhuapp.com"))
-    {
+    if parsed.scheme() != "https" || !(host == "lanhuapp.com" || host.ends_with(".lanhuapp.com")) {
         return Err("只能导航到 Lake 页面地址".to_string());
     }
     Ok(parsed)
 }
 
-#[tauri::command]
-fn open_lanhu_browser(
-    app: tauri::AppHandle,
-    url: String,
+fn bring_lake_browser_to_front(
+    webview: &tauri::WebviewWindow,
 ) -> Result<(), String> {
+    // macOS can keep an existing WebView minimized or behind the main window
+    // even after show(). Restore it before requesting focus.
+    webview
+        .unminimize()
+        .map_err(|error| format!("恢复 Lake 页面窗口失败：{error}"))?;
+    webview
+        .show()
+        .map_err(|error| format!("显示 Lake 页面窗口失败：{error}"))?;
+    webview
+        .set_focus()
+        .map_err(|error| format!("聚焦 Lake 页面窗口失败：{error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn open_lanhu_browser(app: tauri::AppHandle, url: String) -> Result<(), String> {
     let parsed = validate_lake_url(&url)?;
 
-    if let Some(webview) = app.get_webview("lanhu-browser") {
+    if let Some(webview) = app.get_webview_window("lanhu-browser") {
         webview
             .navigate(parsed)
-            .and_then(|_| webview.show())
-            .and_then(|_| webview.set_focus())
-            .map_err(|error| format!("显示 Lake 页面失败：{error}"))?;
+            .map_err(|error| format!("导航到 Lake 页面失败：{error}"))?;
+        bring_lake_browser_to_front(&webview)?;
         return Ok(());
     }
 
+    let download_app = app.clone();
     WebviewWindowBuilder::new(&app, "lanhu-browser", WebviewUrl::External(parsed))
         .title("Lake")
         .inner_size(1280.0, 860.0)
         .min_inner_size(900.0, 600.0)
         .incognito(false)
         .data_store_identifier(LAKE_DATA_STORE_IDENTIFIER)
+        .on_download(move |_webview, event| {
+            if let DownloadEvent::Requested { url, destination } = event {
+                if let Ok(mut pending) = download_app.state::<BrowserDownloadState>().pending.lock()
+                {
+                    if let Some(path) = pending.remove(url.as_str()) {
+                        *destination = path;
+                    }
+                }
+            }
+            true
+        })
         .build()
         .map_err(|error| format!("创建 Lake 页面窗口失败：{error}"))?;
     Ok(())
@@ -1387,15 +1920,10 @@ fn open_lanhu_browser(
 
 #[tauri::command]
 fn focus_lanhu_browser(app: tauri::AppHandle) -> Result<bool, String> {
-    let Some(webview) = app.get_webview("lanhu-browser") else {
+    let Some(webview) = app.get_webview_window("lanhu-browser") else {
         return Ok(false);
     };
-    webview
-        .show()
-        .map_err(|error| format!("显示 Lake 页面窗口失败：{error}"))?;
-    webview
-        .set_focus()
-        .map_err(|error| format!("聚焦 Lake 页面窗口失败：{error}"))?;
+    bring_lake_browser_to_front(&webview)?;
     Ok(true)
 }
 
@@ -2019,6 +2547,10 @@ async fn get_lanhu_browser_snapshot(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            app.manage(BrowserDownloadState::default());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             app_info,
             load_app_state,
@@ -2145,6 +2677,29 @@ mod tests {
         let bounds = layer_bounds(&value).expect("bounds object should still be returned");
         assert_eq!(bounds.x, 0.0);
         assert_eq!(bounds.width, 20.0);
+    }
+
+    #[test]
+    fn preserves_array_based_visual_style_fields() {
+        let design = serde_json::json!({
+            "layers": [{
+                "id": "gradient-card",
+                "type": "shapeLayer",
+                "fills": [{ "type": "gradient", "stops": [{ "color": "#123456" }] }],
+                "effects": [{ "type": "dropShadow", "blur": 12 }]
+            }]
+        });
+
+        let (layers, _) = extract_layers(&design);
+        let style = layers
+            .iter()
+            .find(|layer| layer.id == "gradient-card")
+            .and_then(|layer| layer.style.as_ref())
+            .expect("style should preserve visual arrays");
+        assert!(style.get("fills").is_some_and(serde_json::Value::is_array));
+        assert!(style
+            .get("effects")
+            .is_some_and(serde_json::Value::is_array));
     }
 
     #[test]

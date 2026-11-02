@@ -17,7 +17,7 @@
 
 ## 3. 文档结构
 
-每份 `DesignDocument` 至少包含：`id`、`provider`、`sourceUrl`、`title`、`syncedAt`、`syncVersion`、`revisions`、`adapterVersion`、`capabilityReport`、`pageIds`、`rootNodeIds`、`nodes`、`assets` 和 `measurementCandidates`。当前文档保存最新版本，`revisions` 保留最近 10 次同步摘要；旧版本的完整节点树不重复写入。
+每份 `DesignDocument` 至少包含：`id`、`provider`、`sourceUrl`、`title`、`syncedAt`、`syncVersion`、`revisions`、`adapterVersion`、`capabilityReport`、`pageIds`、`rootNodeIds`、`nodes`、`assets` 和 `measurementCandidates`。当前文档保存最新版本，`revisions` 保留最近 10 次同步摘要，`revisionSnapshots` 保留最近 10 次同步的完整节点、资源和测量候选快照，以支持本地历史版本查看。升级前创建的旧文档会在下一次同步时自动补建旧版本快照。
 
 每个 `DesignAsset` 可以带有 `density` 和 `downloadPolicy`：`skip-density-variant` 表示明确为 `mdpi`/`hdpi`、不进入下载队列；`download-candidate` 表示明确为其他密度、可进入后续下载队列；`review` 表示无法确认密度、不得自动下载。`2x` 等缩放标识不会自动映射成 `hdpi`。
 

@@ -5,6 +5,7 @@ interface LayerInspectorProps {
   document?: DesignDocument;
   selectedNodeId?: string;
   onSelect: (nodeId: string) => void;
+  onCopyReference?: (value: string, label: string) => void;
 }
 
 function kindLabel(node: DesignNode) {
@@ -19,6 +20,18 @@ function boundsLabel(node: DesignNode) {
   if (!node.bounds) return "无边界";
   const { x, y, width, height } = node.bounds;
   return `${Math.round(x)}, ${Math.round(y)} · ${Math.round(width)} × ${Math.round(height)}`;
+}
+
+function hierarchyLabel(node: DesignNode, nodes: Record<string, DesignNode>) {
+  const path: string[] = [];
+  const visited = new Set<string>();
+  let current: DesignNode | undefined = node;
+  while (current && !visited.has(current.id)) {
+    visited.add(current.id);
+    path.unshift(current.name || current.id);
+    current = current.parentId ? nodes[current.parentId] : undefined;
+  }
+  return path.join(" / ");
 }
 
 function TreeNode({
@@ -58,7 +71,7 @@ function TreeNode({
   );
 }
 
-export default function LayerInspector({ document, selectedNodeId, onSelect }: LayerInspectorProps) {
+export default function LayerInspector({ document, selectedNodeId, onSelect, onCopyReference }: LayerInspectorProps) {
   const nodes = document?.nodes ?? {};
   const lakeNodes = useMemo(() => Object.values(nodes).filter((node) => node.sourceRef?.startsWith("lake-json:")), [nodes]);
   const roots = useMemo(() => {
@@ -88,21 +101,33 @@ export default function LayerInspector({ document, selectedNodeId, onSelect }: L
           {roots.map((node) => <TreeNode key={node.id} node={node} nodes={nodes} depth={0} selectedNodeId={selectedNodeId} onSelect={onSelect} />)}
           {roots.length === 0 && <p className="document-note">当前图层没有可识别的根节点。</p>}
         </div>
-        <div className="layer-details">
+        <div className="layer-details" aria-live="polite" data-selected-node-id={selectedNode?.id ?? ""}>
           {selectedNode ? (
             <>
-              <div className="layer-detail-title">
+              <div className="layer-detail-current">
+                <span>当前选中图层</span>
                 <strong>{selectedNode.name || "未命名图层"}</strong>
-                <span>{kindLabel(selectedNode)}</span>
+                <em>{kindLabel(selectedNode)} · {selectedNode.type}</em>
+              </div>
+              <div className="layer-detail-actions">
+                <button
+                  className="small-button"
+                  onClick={() => onCopyReference?.(`lake://design-node/${encodeURIComponent(document.id)}/${encodeURIComponent(selectedNode.id)}`, "节点定位")}
+                  disabled={!onCopyReference}
+                >
+                  复制节点定位
+                </button>
               </div>
               <dl className="layer-detail-list">
-                <div><dt>类型</dt><dd>{selectedNode.type}</dd></div>
+                <div><dt>节点 ID</dt><dd className="layer-detail-code">{selectedNode.id}</dd></div>
+                <div><dt>层级路径</dt><dd>{hierarchyLabel(selectedNode, nodes)}</dd></div>
                 <div><dt>边界</dt><dd>{boundsLabel(selectedNode)}</dd></div>
                 <div><dt>可见性</dt><dd>{selectedNode.visible === false ? "隐藏" : "可见"}</dd></div>
                 <div><dt>父节点</dt><dd>{selectedNode.parentId ? nodes[selectedNode.parentId]?.name || selectedNode.parentId : "根节点"}</dd></div>
+                <div><dt>子节点</dt><dd>{selectedNode.children.length} 个</dd></div>
                 {selectedNode.text && <div><dt>文字</dt><dd className="layer-detail-text">{selectedNode.text}</dd></div>}
                 {selectedNode.assetUrl && <div><dt>资源候选</dt><dd className="layer-detail-url">{selectedNode.assetUrl}</dd></div>}
-                <div><dt>来源</dt><dd className="layer-detail-url">{selectedNode.sourceRef}</dd></div>
+                <div><dt>来源</dt><dd className="layer-detail-code">{selectedNode.sourceRef}</dd></div>
               </dl>
               {styles.length > 0 && (
                 <div className="layer-style-block">
