@@ -1,0 +1,52 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors and local tooling
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# JavaScript / pnpm dependencies and caches
+node_modules/
+.pnpm-store/
+.npm/
+.yarn/
+.pnp.*
+
+# TypeScript and frontend build output
+*.tsbuildinfo
+dist/
+coverage/
+.turbo/
+
+# Rust and Tauri build output
+target/
+**/target/
+apps/desktop/src-tauri/gen/
+
+# Generated bundled MCP runtime. It is recreated by the desktop build.
+apps/desktop/src-tauri/resources/mcp-server/
+
+# Local Cargo registries and project-local Cargo cache
+.cargo/
+.cargo-home/
+
+# Generated AI implementation preview artifacts.
+# Keep generate.mjs and README.md under examples/ai-implementation.
+examples/ai-implementation/index.html
+examples/ai-implementation/index.json
+examples/ai-implementation/implementation-context.json
+
+# Local release archives and packaged applications
+*.zip
+*.dmg
+*.app

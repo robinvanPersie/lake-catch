@@ -1,0 +1,15 @@
+{
+  "name": "lanhu-bridge",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "check": "pnpm -r typecheck",
+    "dev:desktop": "pnpm --filter @lake/desktop dev",
+    "implementation:preview": "node examples/ai-implementation/generate.mjs",
+    "build:desktop": "pnpm --filter @lake/desktop build",
+    "verify:mcp-bundle": "node scripts/verify-mcp-bundle.mjs",
+    "build:desktop:arm64": "pnpm --filter @lake/desktop tauri build --target aarch64-apple-darwin",
+    "build:desktop:arm64:app": "pnpm --filter @lake/desktop tauri build --target aarch64-apple-darwin --bundles app && node scripts/sign-macos-app.mjs apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/'Lake Catch.app'"
+  }
+}

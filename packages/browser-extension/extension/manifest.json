@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Lake Catch Connector",
+  "version": "0.1.0",
+  "description": "Connects a supported design page to the local Lake Catch desktop application.",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": ["activeTab", "nativeMessaging"],
+  "host_permissions": ["https://*.lanhuapp.com/*"]
+}
