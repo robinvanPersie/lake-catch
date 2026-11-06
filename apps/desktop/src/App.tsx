@@ -402,7 +402,7 @@ export default function App() {
       const restoredDocument = restoredDocumentId ? storedDocuments.find((item) => item.id === restoredDocumentId) : undefined;
       const restoredNodeId = restoredDocument && typeof state.currentNodeId === "string" && restoredDocument.nodes[state.currentNodeId]
         ? state.currentNodeId
-        : restoredDocument?.rootNodeIds[0] ?? null;
+        : null;
       setHistory(records);
       setResult(records[0] ?? null);
       setDocuments(storedDocuments);
@@ -431,10 +431,8 @@ export default function App() {
       ? currentDocument.revisionSnapshots?.find((snapshot) => snapshot.version === activeRevisionVersion)
       : undefined;
     const nodes = currentSnapshot?.nodes ?? currentDocument.nodes;
-    const rootNodeIds = currentSnapshot?.rootNodeIds ?? currentDocument.rootNodeIds;
     if (selectedNodeId && nodes[selectedNodeId]) return;
-    const fallbackNodeId = rootNodeIds.find((nodeId) => nodes[nodeId]?.sourceRef?.startsWith("lake-json:")) ?? rootNodeIds[0];
-    if (fallbackNodeId !== selectedNodeId) setSelectedNodeId(fallbackNodeId);
+    if (selectedNodeId) setSelectedNodeId(undefined);
   }, [activeRevisionVersion, documentId, documents, selectedNodeId]);
 
   const report = result?.report;
@@ -930,11 +928,11 @@ export default function App() {
       const nextDocuments = [document, ...documents.filter((item) => item.id !== document.id)].slice(0, 20);
       setDocuments(nextDocuments);
       const nextHistory = [record, ...history.filter((item) => item.report.pageUrl !== record.report.pageUrl)].slice(0, 10);
-      await saveAppState({ history: nextHistory, documents: nextDocuments, contexts, currentDocumentId: document.id, currentNodeId: document.rootNodeIds[0] ?? null });
+      await saveAppState({ history: nextHistory, documents: nextDocuments, contexts, currentDocumentId: document.id, currentNodeId: null });
       setHistory(nextHistory);
       setResult(record);
       setDocumentId(document.id);
-      setSelectedNodeId(document.rootNodeIds[0]);
+      setSelectedNodeId(undefined);
       setActiveRevisionVersion(null);
       setActiveView("preview");
       setStatus(apiSyncResult?.status === "ready"
@@ -1076,11 +1074,11 @@ export default function App() {
     setStatus("已导出脱敏诊断日志");
   }
 
-  function createCurrentContext() {
-    if (!documentId || !selectedNodeId) return;
+  async function createCurrentContext(nodeId = selectedNodeId) {
+    if (!documentId || !nodeId) return undefined;
     const document = viewedDocument;
-    const selectedNode = document?.nodes[selectedNodeId];
-    if (!document || !selectedNode || !selectedNode.sourceRef?.startsWith("lake-json:")) return;
+    const selectedNode = document?.nodes[nodeId];
+    if (!document || !selectedNode || !selectedNode.sourceRef?.startsWith("lake-json:")) return undefined;
 
     const nodeIds: string[] = [];
     const visit = (nodeId: string) => {
@@ -1100,8 +1098,40 @@ export default function App() {
     };
     const nextContexts = [context, ...contexts.filter((item) => item.id !== context.id)].slice(0, 50);
     setContexts(nextContexts);
-    void saveAppState({ history, documents, contexts: nextContexts, currentDocumentId: documentId, currentNodeId: selectedNodeId ?? null });
+    try {
+      await saveAppState({ history, documents, contexts: nextContexts, currentDocumentId: documentId, currentNodeId: nodeId });
+    } catch {
+      // Keep the UI usable if persistence is temporarily unavailable. The current selection remains in memory.
+    }
     setStatus(`已创建上下文：${context.label}（${nodeIds.length} 个节点）`);
+    return context;
+  }
+
+  async function deliverCurrentNodeToAi(nodeId: string) {
+    const document = viewedDocument;
+    const selectedNode = document?.nodes[nodeId];
+    if (!document || !selectedNode || !selectedNode.sourceRef?.startsWith("lake-json:")) {
+      setStatus("当前选中的不是可交付的真实设计图层");
+      return;
+    }
+
+    const context = await createCurrentContext(nodeId);
+    if (!context) return;
+
+    const handoff = [
+      "请使用当前 Lake MCP 实现我刚交付的设计节点。",
+      `设计稿：${document.title || "未命名设计稿"}`,
+      `节点：${selectedNode.name || selectedNode.id}`,
+      `contextId：${context.id}`,
+      "请读取该 context 的结构化节点、官方视觉预览图和可用资源；然后按照我指定的目标平台实现，不要把整页预览图当作页面代码。"
+    ].join("\n");
+
+    try {
+      await copyText(handoff);
+      setStatus(`已交给 AI：${context.label}（${context.nodeIds.length} 个节点，交付信息已复制）`);
+    } catch {
+      setStatus(`已交给 AI：${context.label}（${context.nodeIds.length} 个节点）；交付信息复制失败，但 MCP 当前选区已更新`);
+    }
   }
 
   async function copyImplementationReference(value: string, label: string) {
@@ -1354,6 +1384,7 @@ export default function App() {
               measurementCandidates={viewedDocument?.measurementCandidates ?? []}
               selectedNodeId={selectedNodeId}
               onSelectNode={(nodeId) => { selectNode(nodeId); setActiveView("preview"); }}
+              onDeliverNode={deliverCurrentNodeToAi}
             />
           ) : (
             <div className="browser-content">
@@ -1568,7 +1599,7 @@ export default function App() {
                         </div>
                         <button
                           className="small-button context-create-button"
-                          onClick={createCurrentContext}
+                          onClick={() => { void createCurrentContext(); }}
                           disabled={!selectedNodeId || !document.nodes[selectedNodeId]?.sourceRef?.startsWith("lake-json:")}
                         >
                           从当前图层创建上下文

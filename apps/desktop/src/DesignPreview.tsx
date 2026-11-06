@@ -9,6 +9,7 @@ interface DesignPreviewProps {
   measurementCandidates?: DesignMeasurementCandidate[];
   selectedNodeId?: string;
   onSelectNode?: (nodeId: string) => void;
+  onDeliverNode?: (nodeId: string) => void | Promise<void>;
 }
 
 function unitLabel(platform?: PagePlatformContext) {
@@ -121,14 +122,14 @@ function shadowValue(value: unknown): string | undefined {
   return cssShadows.length > 0 ? cssShadows.join(", ") : undefined;
 }
 
-export default function DesignPreview({ document, platform, measurementCandidates = [], selectedNodeId, onSelectNode }: DesignPreviewProps) {
+export default function DesignPreview({ document, platform, measurementCandidates = [], selectedNodeId, onSelectNode, onDeliverNode }: DesignPreviewProps) {
   const [zoom, setZoom] = useState(1);
   const [officialPreviewFailed, setOfficialPreviewFailed] = useState(false);
   const [hitCandidates, setHitCandidates] = useState<string[]>([]);
   const [hitIndex, setHitIndex] = useState(0);
   const [lastHitPoint, setLastHitPoint] = useState<{ x: number; y: number }>();
   const title = document?.title || "待同步设计稿";
-  const selectedNode = selectedNodeId && document?.nodes[selectedNodeId];
+  const selectedNode = selectedNodeId ? document?.nodes[selectedNodeId] : undefined;
   const candidateCount = measurementCandidates.length;
   const layerNodes = Object.values(document?.nodes ?? {}).filter((node) => node.sourceRef?.startsWith("lake-json:"));
   const rootNode = document?.rootNodeIds.map((id) => document.nodes[id]).find((node) => node?.bounds);
@@ -311,14 +312,21 @@ export default function DesignPreview({ document, platform, measurementCandidate
         <div>
           <p className="preview-kicker">候选规格预览</p>
           <h3>{title}</h3>
-          <div className={`preview-selection ${selectedNode ? "is-selected" : ""}`} aria-live="polite">
-            <span className="preview-selection-dot" aria-hidden="true" />
-            {selectedNode ? (
-              <>
-                <strong>已选图层：{selectedNode.name || "未命名图层"}</strong>
-                <span>{selectedNode.type} · {selectedNode.bounds ? `${Math.round(selectedNode.bounds.width)} × ${Math.round(selectedNode.bounds.height)}` : "无边界"}</span>
-              </>
-            ) : <span>尚未选中图层</span>}
+          <div className="preview-selection-row">
+            <div className={`preview-selection ${selectedNode ? "is-selected" : ""}`} aria-live="polite">
+              <span className="preview-selection-dot" aria-hidden="true" />
+              {selectedNode ? (
+                <>
+                  <strong>已选图层：{selectedNode.name || "未命名图层"}</strong>
+                  <span>{selectedNode.type} · {selectedNode.bounds ? `${Math.round(selectedNode.bounds.width)} × ${Math.round(selectedNode.bounds.height)}` : "无边界"}</span>
+                </>
+              ) : <span>尚未选中图层</span>}
+            </div>
+            {selectedNode?.sourceRef?.startsWith("lake-json:") && onDeliverNode && (
+              <button type="button" className="primary small-button preview-deliver-button" onClick={() => void onDeliverNode(selectedNode.id)}>
+                交给 AI
+              </button>
+            )}
           </div>
         </div>
         <div className="preview-controls" aria-label="画布缩放">

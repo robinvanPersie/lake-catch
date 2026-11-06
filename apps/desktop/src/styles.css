@@ -178,11 +178,14 @@ dt { color: #7c8791; font-size: 11px; margin-bottom: 4px; } dd { margin: 0; over
 .preview-kicker { margin: 0 0 4px; color: #87919b; font-size: 10px; font-weight: 700; letter-spacing: .7px; text-transform: uppercase; }
 .preview-toolbar h3 { margin: 0; color: #303943; font-size: 15px; }
 .preview-selection { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; min-height: 20px; margin-top: 7px; color: #7c8791; font-size: 10px; }
+.preview-selection-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.preview-selection-row .preview-selection { min-width: 0; }
 .preview-selection.is-selected { color: #244f9e; }
 .preview-selection strong { color: #1f3f79; font-size: 11px; font-weight: 700; }
 .preview-selection span { overflow-wrap: anywhere; }
 .preview-selection-dot { width: 7px; height: 7px; flex: 0 0 7px; border: 1px solid #aab6c2; border-radius: 50%; background: #dbe2e8; }
 .preview-selection.is-selected .preview-selection-dot { border-color: #2864d7; background: #2864d7; box-shadow: 0 0 0 3px #e1ebff; }
+.preview-deliver-button { flex: 0 0 auto; margin-top: 7px; white-space: nowrap; }
 .preview-controls { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .zoom-value { min-width: 48px; color: #465361; font-size: 12px; text-align: center; font-variant-numeric: tabular-nums; }
 .icon-button { width: 30px; height: 30px; padding: 0; border: 1px solid #cbd5df; border-radius: 6px; background: #fff; color: #23313e; font-size: 18px; line-height: 1; cursor: pointer; }
