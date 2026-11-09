@@ -188,19 +188,6 @@ function formatTime(value: string) {
   return new Date(value).toLocaleString("zh-CN", { hour12: false });
 }
 
-function assetTargetDirectory(asset: DesignAsset) {
-  return asset.kind === "icon" ? "res/mipmap" : "res/drawable";
-}
-
-function assetQualityLabels(asset: DesignAsset) {
-  const labels: string[] = [];
-  if (!asset.sourceUrl) labels.push("缺少 URL");
-  if (!asset.density || asset.downloadPolicy === "review" || asset.downloadStatus === "review") labels.push("密度待复核");
-  if (asset.downloadStatus === "failed") labels.push("下载失败");
-  if (asset.localPath && asset.downloadStatus !== "downloaded" && asset.downloadStatus !== "cached" && asset.downloadStatus !== "skipped") labels.push("本地缓存待检查");
-  return labels;
-}
-
 async function copyText(value: string) {
   try {
     if (navigator.clipboard?.writeText) {
@@ -1351,21 +1338,31 @@ export default function App() {
       </section>
 
       <section className="mcp-panel panel" aria-label="AI 工具连接">
-        <div className="mcp-panel-heading">
-          <div>
-            <h2>AI 工具连接</h2>
+        <div className="mcp-panel-main">
+          <div className="mcp-panel-heading">
+            <div className="mcp-panel-title">
+              <h2>AI 工具连接</h2>
+              <span className="mcp-transport">stdio · 本机进程</span>
+            </div>
             <p className="hint">把 Lake MCP 接入当前 Codex，或复制标准配置给其他支持 stdio MCP 的 AI 工具。</p>
           </div>
-          <span className="mcp-transport">stdio · 本机进程</span>
+          <div className="mcp-panel-actions">
+            <button className="primary" onClick={() => void configureCodexMcp()} disabled={isConfiguringMcp}>
+              {isConfiguringMcp ? "正在配置…" : "添加到 Codex"}
+            </button>
+            <button onClick={() => void copyGenericMcpConfig()}>复制通用配置</button>
+          </div>
         </div>
-        <div className="mcp-panel-actions">
-          <button className="primary" onClick={() => void configureCodexMcp()} disabled={isConfiguringMcp}>
-            {isConfiguringMcp ? "正在配置…" : "添加到 Codex"}
-          </button>
-          <button onClick={() => void copyGenericMcpConfig()}>复制通用配置</button>
-        </div>
-        <pre className="mcp-config" aria-label="通用 MCP 配置"><code>{mcpConfigPreview}</code></pre>
-        <p className="mcp-note">Codex 点击后重启即可生效；其他 AI 工具粘贴这段 JSON 到它们的 MCP 配置中。应用会先备份原有 Codex 配置，不会保存登录信息。</p>
+        <details className="mcp-details">
+          <summary>
+            <span>通用配置与使用说明</span>
+            <span className="mcp-details-action">查看 JSON</span>
+          </summary>
+          <div className="mcp-details-content">
+            <pre className="mcp-config" aria-label="通用 MCP 配置"><code>{mcpConfigPreview}</code></pre>
+            <p className="mcp-note">Codex 点击后重启即可生效；其他 AI 工具粘贴这段 JSON 到它们的 MCP 配置中。应用会先备份原有 Codex 配置，不会保存登录信息。</p>
+          </div>
+        </details>
       </section>
 
       <section className="workspace">
@@ -1513,49 +1510,55 @@ export default function App() {
                   return (
                     <>
                       <section className={`implementation-status ${confirmedNodeCount > 0 ? "is-ready" : "is-partial"}`} aria-label="AI 实现上下文状态">
-                        <div className="section-heading">
-                          <h3>AI 实现上下文</h3>
-                          <span>{implementationStatus}</span>
-                        </div>
-                        <div className="implementation-reference">
+                        <div className="implementation-status-summary">
                           <div>
-                            <strong>整页文档</strong>
-                            <code>{document.id}</code>
+                            <strong>当前设计稿{implementationStatus}</strong>
+                            <span>{nodeCount} 个节点 · {assetCount} 个资源</span>
                           </div>
-                          <div className="implementation-reference-actions">
-                            <em>get_implementation_context · documentId</em>
-                            <button className="small-button" onClick={() => void copyImplementationReference(document.id, "文档 ID")}>复制 ID</button>
-                          </div>
+                          <span className="implementation-status-indicator" aria-hidden="true" />
                         </div>
-                        <div className="implementation-reference-list">
-                          {usableContexts.slice(0, 6).map((context) => (
-                            <div className="implementation-reference" key={context.id}>
-                              <div>
-                                <strong>{context.label || "局部上下文"}</strong>
-                                <code>{context.id}</code>
-                              </div>
-                              <div className="implementation-reference-actions">
-                                <em>{context.nodeIds.length} 个节点 · contextId</em>
-                                <button className="small-button" onClick={() => void copyImplementationReference(context.id, "context ID")}>复制 ID</button>
-                              </div>
+                        <details className="implementation-details">
+                          <summary>技术详情</summary>
+                          <div className="implementation-reference">
+                            <div>
+                              <strong>整页文档</strong>
+                              <code>{document.id}</code>
                             </div>
-                          ))}
-                        </div>
-                        <p className="document-note">
-                          已确认 {confirmedNodeCount}/{nodeCount} 个节点。AI 可用整页文档，或使用未过期的局部 context；重新同步后旧 context 会标记为过期。
-                        </p>
+                            <div className="implementation-reference-actions">
+                              <em>get_implementation_context · documentId</em>
+                              <button className="small-button" onClick={() => void copyImplementationReference(document.id, "文档 ID")}>复制 ID</button>
+                            </div>
+                          </div>
+                          <div className="implementation-reference-list">
+                            {usableContexts.slice(0, 6).map((context) => (
+                              <div className="implementation-reference" key={context.id}>
+                                <div>
+                                  <strong>{context.label || "局部上下文"}</strong>
+                                  <code>{context.id}</code>
+                                </div>
+                                <div className="implementation-reference-actions">
+                                  <em>{context.nodeIds.length} 个节点 · contextId</em>
+                                  <button className="small-button" onClick={() => void copyImplementationReference(context.id, "context ID")}>复制 ID</button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                          <p className="document-note">
+                            已确认 {confirmedNodeCount}/{nodeCount} 个节点。AI 可用整页文档，或使用未过期的局部 context；重新同步后旧 context 会标记为过期。
+                          </p>
+                          <div className="document-stats implementation-stats">
+                            <div><strong>{nodeCount}</strong><span>节点</span></div>
+                            <div><strong>{assetCount}</strong><span>资源</span></div>
+                            <div><strong>{downloadableAssetCount}</strong><span>可下载</span></div>
+                            <div><strong>{skippedDensityAssetCount}</strong><span>跳过 mdpi/hdpi</span></div>
+                            <div><strong>{reviewAssetCount}</strong><span>待确认</span></div>
+                            <div><strong>{downloadedAssetCount + cachedAssetCount}</strong><span>本地可用</span></div>
+                            <div><strong>{failedAssetCount}</strong><span>下载失败</span></div>
+                            <div><strong>{document?.pageIds.length ?? 0}</strong><span>页面</span></div>
+                          </div>
+                          <p className="document-note">当前同步版本 v{syncVersion}，保留 {revisionCount} 个版本摘要。已保存 {nodeCount} 个设计节点候选和 {assetCount} 个资源候选。明确为 mdpi/hdpi 的资源暂不进入下载队列，未知密度资源需要复核。</p>
+                        </details>
                       </section>
-                      <div className="document-stats">
-                        <div><strong>{nodeCount}</strong><span>节点</span></div>
-                        <div><strong>{assetCount}</strong><span>资源</span></div>
-                        <div><strong>{downloadableAssetCount}</strong><span>可下载</span></div>
-                        <div><strong>{skippedDensityAssetCount}</strong><span>跳过 mdpi/hdpi</span></div>
-                        <div><strong>{reviewAssetCount}</strong><span>待确认</span></div>
-                        <div><strong>{downloadedAssetCount + cachedAssetCount}</strong><span>本地可用</span></div>
-                        <div><strong>{failedAssetCount}</strong><span>下载失败</span></div>
-                        <div><strong>{document?.pageIds.length ?? 0}</strong><span>页面</span></div>
-                      </div>
-                      <p className="document-note">当前同步版本 v{syncVersion}，保留 {revisionCount} 个版本摘要。已保存 {nodeCount} 个设计节点候选和 {assetCount} 个资源候选。明确为 mdpi/hdpi 的资源暂不进入下载队列，未知密度资源需要复核。</p>
                       {revisionCount > 1 && (
                         <div className="revision-list" aria-label="同步版本">
                           {document.revisions?.slice().reverse().map((revision) => (
@@ -1566,19 +1569,6 @@ export default function App() {
                               <em>{revision.version === (activeRevisionVersion ?? syncVersion) ? "当前查看" : revision.capabilityStatus}</em>
                             </button>
                           ))}
-                        </div>
-                      )}
-                      {assetValues.length > 0 && (
-                        <div className="asset-list" aria-label="资源状态">
-                          {assetValues.slice(0, 24).map((asset) => (
-                            <div className="asset-list-item" key={asset.id}>
-                              <span className="asset-list-name" title={asset.name}>{asset.name}</span>
-                              <span>{asset.width && asset.height ? `${asset.width} × ${asset.height}` : "尺寸未知"} · {asset.density ?? "密度未知"}</span>
-                              <span>{assetTargetDirectory(asset)}</span>
-                              <span>{asset.downloadStatus === "downloaded" ? "已下载" : asset.downloadStatus === "cached" ? "缓存复用" : asset.downloadStatus === "skipped" ? "已跳过" : asset.downloadStatus === "review" ? "待确认" : asset.downloadStatus === "failed" ? "失败" : "待处理"}{assetQualityLabels(asset).length > 0 ? ` · ${assetQualityLabels(asset).join("、")}` : ""}{(asset.referenceCount ?? 1) > 1 ? ` · ${asset.referenceCount}处引用` : ""}</span>
-                            </div>
-                          ))}
-                          {assetValues.length > 24 && <p className="document-note">仅显示前 24 个资源，完整资源仍可通过 MCP 查询。</p>}
                         </div>
                       )}
                       <div className="document-actions">
