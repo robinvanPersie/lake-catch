@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties, type MouseEvent } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type MouseEvent, type PointerEvent, type WheelEvent } from "react";
 import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import type { PagePlatformContext } from "@lake/protocol";
 import type { DesignDocument, DesignMeasurementCandidate, DesignNode } from "@lake/design-model";
@@ -126,10 +126,18 @@ function shadowValue(value: unknown): string | undefined {
 
 export default function DesignPreview({ document, platform, measurementCandidates = [], selectedNodeId, onSelectNode, onDeliverNode, isFocused = false, onToggleFocus }: DesignPreviewProps) {
   const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [isPanning, setIsPanning] = useState(false);
+  const [spacePressed, setSpacePressed] = useState(false);
   const [officialPreviewFailed, setOfficialPreviewFailed] = useState(false);
   const [hitCandidates, setHitCandidates] = useState<string[]>([]);
   const [hitIndex, setHitIndex] = useState(0);
   const [lastHitPoint, setLastHitPoint] = useState<{ x: number; y: number }>();
+  const stageRef = useRef<HTMLDivElement>(null);
+  const worldRef = useRef<HTMLDivElement>(null);
+  const deviceRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ pointerId: number; x: number; y: number; moved: boolean }>();
+  const suppressClickRef = useRef(false);
   const title = document?.title || "待同步设计稿";
   const selectedNode = selectedNodeId ? document?.nodes[selectedNodeId] : undefined;
   const candidateCount = measurementCandidates.length;
@@ -200,11 +208,39 @@ export default function DesignPreview({ document, platform, measurementCandidate
 
   useEffect(() => {
     setZoom(1);
+    setPan({ x: 0, y: 0 });
     setOfficialPreviewFailed(false);
     setHitCandidates([]);
     setHitIndex(0);
     setLastHitPoint(undefined);
   }, [document?.id, document?.syncedAt]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : undefined;
+      const isInteractive = Boolean(target?.closest("input, textarea, button, select, [contenteditable='true']"));
+      if (event.code === "Space" && !event.repeat && !isInteractive) {
+        event.preventDefault();
+        setSpacePressed(true);
+      }
+    };
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.code === "Space") setSpacePressed(false);
+    };
+    const handleBlur = () => {
+      setSpacePressed(false);
+      setIsPanning(false);
+      dragRef.current = undefined;
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleBlur);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleBlur);
+    };
+  }, []);
 
   const layerKind = (node: (typeof layerNodes)[number]) => {
     const type = node.type.toLowerCase();
@@ -269,7 +305,98 @@ export default function DesignPreview({ document, platform, measurementCandidate
     return node.assetUrl;
   };
 
+  const clampZoom = (value: number) => Math.min(4, Math.max(0.1, value));
+
+  const zoomAt = (nextZoomValue: number, clientX?: number, clientY?: number) => {
+    const stage = stageRef.current;
+    const world = worldRef.current;
+    const device = deviceRef.current;
+    const nextZoom = clampZoom(nextZoomValue);
+    if (!stage || !world || !device || nextZoom === zoom) {
+      setZoom(nextZoom);
+      return;
+    }
+
+    const stageRect = stage.getBoundingClientRect();
+    const worldRect = world.getBoundingClientRect();
+    const deviceRect = device.getBoundingClientRect();
+    const pointerIsInsideStage = clientX !== undefined
+      && clientY !== undefined
+      && clientX >= stageRect.left
+      && clientX <= stageRect.right
+      && clientY >= stageRect.top
+      && clientY <= stageRect.bottom;
+    const anchorX = pointerIsInsideStage ? clientX : stageRect.left + stageRect.width / 2;
+    const anchorY = pointerIsInsideStage ? clientY : stageRect.top + stageRect.height / 2;
+    const nextDeviceWidth = coordinateWidth * renderScale * nextZoom;
+    const widthRatio = nextDeviceWidth / deviceRect.width;
+    const heightRatio = nextZoom / zoom;
+    const localX = anchorX - deviceRect.left;
+    const localY = anchorY - deviceRect.top;
+    const nextDeviceLeft = anchorX - localX * widthRatio;
+    const nextDeviceTop = anchorY - localY * heightRatio;
+
+    // The world includes the ruler and gap, and CSS centers that entire width.
+    // Account for its width change so the point under the cursor stays fixed.
+    const fixedWorldWidth = worldRect.width - deviceRect.width;
+    const nextWorldWidth = nextDeviceWidth + fixedWorldWidth;
+    const unpannedWorldLeft = worldRect.left - pan.x;
+    const nextUnpannedWorldLeft = unpannedWorldLeft - (nextWorldWidth - worldRect.width) / 2;
+    const unpannedWorldTop = worldRect.top - pan.y;
+
+    setPan({
+      x: nextDeviceLeft - nextUnpannedWorldLeft,
+      y: nextDeviceTop - unpannedWorldTop
+    });
+    setZoom(nextZoom);
+  };
+
+  const handleStageWheel = (event: WheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    if (event.ctrlKey || event.metaKey) {
+      const factor = Math.exp(-event.deltaY * 0.004);
+      zoomAt(zoom * factor, event.clientX, event.clientY);
+      return;
+    }
+    const horizontalDelta = event.shiftKey && Math.abs(event.deltaX) < Math.abs(event.deltaY) ? event.deltaY : event.deltaX;
+    const verticalDelta = event.shiftKey ? 0 : event.deltaY;
+    setPan((value) => ({ x: value.x - horizontalDelta, y: value.y - verticalDelta }));
+  };
+
+  const handleStagePointerDown = (event: PointerEvent<HTMLDivElement>) => {
+    stageRef.current?.focus({ preventScroll: true });
+    if (event.button !== 1 && !(event.button === 0 && spacePressed)) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, moved: false };
+    setIsPanning(true);
+  };
+
+  const handleStagePointerMove = (event: PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const deltaX = event.clientX - drag.x;
+    const deltaY = event.clientY - drag.y;
+    if (Math.abs(deltaX) + Math.abs(deltaY) > 2) drag.moved = true;
+    drag.x = event.clientX;
+    drag.y = event.clientY;
+    setPan((value) => ({ x: value.x + deltaX, y: value.y + deltaY }));
+  };
+
+  const finishStagePan = (event: PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    suppressClickRef.current = drag.moved;
+    dragRef.current = undefined;
+    setIsPanning(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+
   const handleCanvasClick = (event: MouseEvent<HTMLDivElement>) => {
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false;
+      return;
+    }
     const canvas = event.currentTarget;
     const rect = canvas.getBoundingClientRect();
     const point = {
@@ -332,11 +459,11 @@ export default function DesignPreview({ document, platform, measurementCandidate
           </div>
         </div>
         <div className="preview-controls" aria-label="画布缩放">
-          <button type="button" className="icon-button" onClick={() => setZoom((value) => Math.max(0.25, Math.round((value - 0.25) * 100) / 100))} aria-label="缩小画布" title="缩小">−</button>
+          <button type="button" className="icon-button" onClick={() => zoomAt(Math.round((zoom - 0.25) * 100) / 100)} aria-label="缩小画布" title="缩小">−</button>
           <span className="zoom-value">{Math.round(zoom * 100)}%</span>
-          <button type="button" className="icon-button" onClick={() => setZoom((value) => Math.min(4, Math.round((value + 0.25) * 100) / 100))} aria-label="放大画布" title="放大">+</button>
-          <button type="button" className="small-button" onClick={() => setZoom(1 / renderScale)}>原始比例</button>
-          <button type="button" className="small-button" onClick={() => setZoom(1)}>适配宽度</button>
+          <button type="button" className="icon-button" onClick={() => zoomAt(Math.round((zoom + 0.25) * 100) / 100)} aria-label="放大画布" title="放大">+</button>
+          <button type="button" className="small-button" onClick={() => { setZoom(clampZoom(1 / renderScale)); setPan({ x: 0, y: 0 }); }}>原始比例</button>
+          <button type="button" className="small-button" onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}>适配宽度</button>
           {onToggleFocus && (
             <button type="button" className="small-button preview-focus-button" onClick={onToggleFocus} aria-pressed={isFocused}>
               {isFocused ? "退出专注" : "专注预览"}
@@ -353,8 +480,19 @@ export default function DesignPreview({ document, platform, measurementCandidate
           : "当前还没有可用的设计图层。这里仅展示平台宽度和滚动模型，不代表真实视觉稿还原。"}
       </div>
 
-      <div className="preview-stage">
-        <div className={`preview-device ${hasRealLayers ? "preview-device-real" : ""}`} style={{ width: `${coordinateWidth * effectiveScale}px`, ...(hasOfficialPreview ? { height: `${previewHeight}px` } : { minHeight: `${previewHeight}px` }) }}>
+      <div
+        ref={stageRef}
+        className={`preview-stage ${spacePressed ? "is-space-pan" : ""} ${isPanning ? "is-panning" : ""}`}
+        onWheel={handleStageWheel}
+        onPointerDown={handleStagePointerDown}
+        onPointerMove={handleStagePointerMove}
+        onPointerUp={finishStagePan}
+        onPointerCancel={finishStagePan}
+        tabIndex={0}
+        aria-label="设计预览画布。双指滑动可移动，捏合可缩放，按住空格拖动也可移动。"
+      >
+        <div ref={worldRef} className="preview-canvas-world" style={{ transform: `translate(calc(-50% + ${pan.x}px), ${pan.y}px)` }}>
+        <div ref={deviceRef} className={`preview-device ${hasRealLayers ? "preview-device-real" : ""}`} style={{ width: `${coordinateWidth * effectiveScale}px`, ...(hasOfficialPreview ? { height: `${previewHeight}px` } : { minHeight: `${previewHeight}px` }) }}>
           {hasRealLayers ? (
             <div className="design-layer-canvas" style={{ width: `${coordinateWidth * effectiveScale}px`, height: `${previewHeight}px` }} onClick={handleCanvasClick} role="application" aria-label="设计画布">
               {hasOfficialPreview && previewSource && (
@@ -427,6 +565,8 @@ export default function DesignPreview({ document, platform, measurementCandidate
             <span>候选内容高度 {targetHeight}{unitLabel(platform)}</span>
           </div>
         )}
+        </div>
+        <div className="preview-navigation-hint" aria-hidden="true">滚轮/双指移动 · 捏合缩放 · 空格拖动</div>
       </div>
 
       <footer className="preview-footer">
