@@ -314,6 +314,7 @@ export default function App() {
   const [diagnosticLog, setDiagnosticLog] = useState<DiagnosticLogEntry[]>([]);
   const [isConfiguringMcp, setIsConfiguringMcp] = useState(false);
   const [isPreviewFocused, setIsPreviewFocused] = useState(false);
+  const [isLayerInspectorCollapsed, setIsLayerInspectorCollapsed] = useState(false);
 
   useEffect(() => {
     if (!status) return;
@@ -1367,7 +1368,17 @@ export default function App() {
         </div>
       </div>
 
-      <section className="workspace">
+      <section className={`workspace ${isLayerInspectorCollapsed ? "is-layer-inspector-collapsed" : ""}`}>
+        <aside className="layer-inspector-panel panel">
+          <LayerInspector
+            document={viewedDocument}
+            selectedNodeId={selectedNodeId}
+            collapsed={isLayerInspectorCollapsed}
+            onToggleCollapsed={() => setIsLayerInspectorCollapsed((collapsed) => !collapsed)}
+            onSelect={(nodeId) => { selectNode(nodeId); setActiveView("preview"); }}
+            onCopyReference={(value, label) => void copyImplementationReference(value, label)}
+          />
+        </aside>
         <div className="browser panel">
           <div className="panel-heading panel-heading-stack">
             <div className="view-tabs" role="tablist" aria-label="主视图">
@@ -1581,12 +1592,6 @@ export default function App() {
                         <button className="small-button danger" onClick={removeCurrentDocument}>删除当前文档</button>
                         <button className="small-button" onClick={clearDocuments} disabled={documents.length === 0}>清空本地文档</button>
                       </div>
-                      <LayerInspector
-                        document={document}
-                        selectedNodeId={selectedNodeId}
-                        onSelect={(nodeId) => { selectNode(nodeId); setActiveView("preview"); }}
-                        onCopyReference={(value, label) => void copyImplementationReference(value, label)}
-                      />
                       <section className="contexts-block" aria-label="DesignContext">
                         <div className="section-heading">
                           <h3>DesignContext</h3>
