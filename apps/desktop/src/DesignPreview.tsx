@@ -10,6 +10,8 @@ interface DesignPreviewProps {
   selectedNodeId?: string;
   onSelectNode?: (nodeId: string) => void;
   onDeliverNode?: (nodeId: string) => void | Promise<void>;
+  isFocused?: boolean;
+  onToggleFocus?: () => void;
 }
 
 function unitLabel(platform?: PagePlatformContext) {
@@ -122,7 +124,7 @@ function shadowValue(value: unknown): string | undefined {
   return cssShadows.length > 0 ? cssShadows.join(", ") : undefined;
 }
 
-export default function DesignPreview({ document, platform, measurementCandidates = [], selectedNodeId, onSelectNode, onDeliverNode }: DesignPreviewProps) {
+export default function DesignPreview({ document, platform, measurementCandidates = [], selectedNodeId, onSelectNode, onDeliverNode, isFocused = false, onToggleFocus }: DesignPreviewProps) {
   const [zoom, setZoom] = useState(1);
   const [officialPreviewFailed, setOfficialPreviewFailed] = useState(false);
   const [hitCandidates, setHitCandidates] = useState<string[]>([]);
@@ -335,6 +337,11 @@ export default function DesignPreview({ document, platform, measurementCandidate
           <button type="button" className="icon-button" onClick={() => setZoom((value) => Math.min(4, Math.round((value + 0.25) * 100) / 100))} aria-label="放大画布" title="放大">+</button>
           <button type="button" className="small-button" onClick={() => setZoom(1 / renderScale)}>原始比例</button>
           <button type="button" className="small-button" onClick={() => setZoom(1)}>适配宽度</button>
+          {onToggleFocus && (
+            <button type="button" className="small-button preview-focus-button" onClick={onToggleFocus} aria-pressed={isFocused}>
+              {isFocused ? "退出专注" : "专注预览"}
+            </button>
+          )}
         </div>
       </div>
 

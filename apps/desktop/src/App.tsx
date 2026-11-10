@@ -313,6 +313,7 @@ export default function App() {
   const [activeRevisionVersion, setActiveRevisionVersion] = useState<number | null>(null);
   const [diagnosticLog, setDiagnosticLog] = useState<DiagnosticLogEntry[]>([]);
   const [isConfiguringMcp, setIsConfiguringMcp] = useState(false);
+  const [isPreviewFocused, setIsPreviewFocused] = useState(false);
 
   useEffect(() => {
     if (!status) return;
@@ -324,6 +325,19 @@ export default function App() {
     };
     setDiagnosticLog((current) => [...current, entry].slice(-100));
   }, [status]);
+
+  useEffect(() => {
+    if (!isPreviewFocused) return;
+    const exitOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setIsPreviewFocused(false);
+    };
+    window.addEventListener("keydown", exitOnEscape);
+    return () => window.removeEventListener("keydown", exitOnEscape);
+  }, [isPreviewFocused]);
+
+  useEffect(() => {
+    if (activeView !== "preview" || !result) setIsPreviewFocused(false);
+  }, [activeView, result]);
 
   useEffect(() => {
     if (!browserOpened) return;
@@ -1313,57 +1327,45 @@ export default function App() {
   const platformContext = report?.diagnostics?.platformContext;
 
   return (
-    <main className="shell">
-      <header className="topbar">
-        <div>
-          <p className="eyebrow">LAKE CATCH · P6</p>
-          <h1>设计稿到代码的本地桥梁</h1>
-        </div>
-        <span className="badge">macOS 应用</span>
-      </header>
-
-      <section className="toolbar panel">
-        <label htmlFor="lanhu-url">Lake 页面地址</label>
-        <div className="url-row">
-          <input id="lanhu-url" value={pageUrl} onChange={(event) => setPageUrl(event.target.value)} />
-          <button onClick={openLanhu}>
-            打开 Lake
-          </button>
-          <button className={`primary sync-button ${isSyncing ? "is-syncing" : ""}`} onClick={syncCurrentPage} disabled={isSyncing || !openedUrl || !isLanhuUrl(openedUrl)}>
-            {isSyncing && <span className="spinner" aria-hidden="true" />}
-            {isSyncing ? "正在同步…" : "同步当前页面"}
-          </button>
-        </div>
-        <p className="hint">登录和页面访问发生在应用内。P0 只接受 Lake 网页地址，记录页面身份，不保存账号密码、Cookie 或 Token。</p>
-      </section>
-
-      <section className="mcp-panel panel" aria-label="AI 工具连接">
-        <div className="mcp-panel-main">
-          <div className="mcp-panel-heading">
-            <div className="mcp-panel-title">
-              <h2>AI 工具连接</h2>
-              <span className="mcp-transport">stdio · 本机进程</span>
+    <main className={`shell ${isPreviewFocused ? "is-preview-focused" : ""}`}>
+      <div className="shell-chrome" aria-hidden={isPreviewFocused}>
+        <div className="shell-chrome-inner">
+          <section className="unified-toolbar panel" aria-label="页面与 AI 工具连接">
+            <div className="unified-url-field">
+              <span className="unified-url-icon" aria-hidden="true">⌁</span>
+              <label className="sr-only" htmlFor="lanhu-url">Lake 页面地址</label>
+              <input id="lanhu-url" value={pageUrl} onChange={(event) => setPageUrl(event.target.value)} />
             </div>
-            <p className="hint">把 Lake MCP 接入当前 Codex，或复制标准配置给其他支持 stdio MCP 的 AI 工具。</p>
-          </div>
-          <div className="mcp-panel-actions">
-            <button className="primary" onClick={() => void configureCodexMcp()} disabled={isConfiguringMcp}>
-              {isConfiguringMcp ? "正在配置…" : "添加到 Codex"}
-            </button>
-            <button onClick={() => void copyGenericMcpConfig()}>复制通用配置</button>
-          </div>
+            <div className="unified-page-actions">
+              <button onClick={openLanhu}>打开 Lake</button>
+              <button className={`primary unified-sync-button ${isSyncing ? "is-syncing" : ""}`} onClick={syncCurrentPage} disabled={isSyncing || !openedUrl || !isLanhuUrl(openedUrl)}>
+                {isSyncing && <span className="spinner" aria-hidden="true" />}
+                {isSyncing ? "正在同步…" : "同步当前页面"}
+              </button>
+            </div>
+            <span className="unified-toolbar-divider" aria-hidden="true" />
+            <div className="unified-mcp-actions">
+              <span className="mcp-connection-status"><span className="mcp-status-dot" aria-hidden="true" />MCP · stdio</span>
+              <button className="primary" onClick={() => void configureCodexMcp()} disabled={isConfiguringMcp}>
+                {isConfiguringMcp ? "正在配置…" : "添加到 Codex"}
+              </button>
+              <details className="unified-more">
+                <summary title="更多连接选项" aria-label="更多连接选项">···</summary>
+                <div className="unified-more-menu">
+                  <button onClick={() => void copyGenericMcpConfig()}>复制通用配置</button>
+                  <details className="unified-config-details">
+                    <summary>查看 MCP JSON</summary>
+                    <div className="unified-config-content">
+                      <pre className="mcp-config" aria-label="通用 MCP 配置"><code>{mcpConfigPreview}</code></pre>
+                      <p className="mcp-note">Codex 点击后重启即可生效；其他 AI 工具粘贴这段 JSON 到它们的 MCP 配置中。应用会先备份原有 Codex 配置，不会保存登录信息。</p>
+                    </div>
+                  </details>
+                </div>
+              </details>
+            </div>
+          </section>
         </div>
-        <details className="mcp-details">
-          <summary>
-            <span>通用配置与使用说明</span>
-            <span className="mcp-details-action">查看 JSON</span>
-          </summary>
-          <div className="mcp-details-content">
-            <pre className="mcp-config" aria-label="通用 MCP 配置"><code>{mcpConfigPreview}</code></pre>
-            <p className="mcp-note">Codex 点击后重启即可生效；其他 AI 工具粘贴这段 JSON 到它们的 MCP 配置中。应用会先备份原有 Codex 配置，不会保存登录信息。</p>
-          </div>
-        </details>
-      </section>
+      </div>
 
       <section className="workspace">
         <div className="browser panel">
@@ -1382,6 +1384,8 @@ export default function App() {
               selectedNodeId={selectedNodeId}
               onSelectNode={(nodeId) => { selectNode(nodeId); setActiveView("preview"); }}
               onDeliverNode={deliverCurrentNodeToAi}
+              isFocused={isPreviewFocused}
+              onToggleFocus={() => setIsPreviewFocused((focused) => !focused)}
             />
           ) : (
             <div className="browser-content">
@@ -1405,7 +1409,8 @@ export default function App() {
         </div>
         <aside className="report panel">
           <div className="panel-heading"><h2>能力报告</h2><div className="heading-actions"><span className="status">{report?.status ?? "not-run"}</span><button className="small-button" onClick={() => void exportConnectionDiagnostic()}>连接诊断</button><button className="small-button" onClick={exportDiagnosticLog}>导出日志</button><button className="small-button" onClick={exportReport} disabled={!report}>导出</button></div></div>
-          {apiSyncResult && (
+          <div className="report-scroll">
+            {apiSyncResult && (
               <div className={`api-sync-summary ${apiSyncResult.status === "ready" ? "is-ready" : "is-failed"}`}>
               <div className="api-sync-summary-heading">
                 <strong>{apiSyncResult.status === "ready" ? "设计 JSON 已接入" : "设计 API 未完成"}</strong>
@@ -1429,8 +1434,8 @@ export default function App() {
               )}
             </div>
           )}
-          {report ? (
-            <>
+            {report ? (
+              <>
               <dl className="metadata">
                 <div><dt>页面标题</dt><dd>{report.pageTitle}</dd></div>
                 <div><dt>页面地址</dt><dd>{report.pageUrl}</dd></div>
@@ -1627,8 +1632,9 @@ export default function App() {
                 <h3>最近同步</h3>
                 {history.map((item) => <button className={`history-item ${item.request.requestId === result?.request.requestId ? "selected" : ""}`} key={item.request.requestId} onClick={() => { setResult(item); setActiveRevisionVersion(null); const nextDocumentId = documentIdFor(item); setDocumentId(nextDocumentId); const nextNodeId = documents.find((document) => document.id === nextDocumentId)?.rootNodeIds[0]; selectNode(nextNodeId, nextDocumentId); setOpenedUrl(item.report.pageUrl); setStatus("已切换到历史同步结果"); }}><span>{item.report.pageTitle}</span><time>{formatTime(item.savedAt)}</time></button>)}
               </div>
-            </>
-          ) : <p className="empty">点击“同步当前页面”生成第一份能力报告。</p>}
+              </>
+            ) : <p className="empty">点击“同步当前页面”生成第一份能力报告。</p>}
+          </div>
         </aside>
       </section>
     </main>
