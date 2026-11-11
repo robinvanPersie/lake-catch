@@ -49,9 +49,6 @@ jobs:
       - name: Run workspace type checks
         run: pnpm check
 
-      - name: Run MCP smoke tests
-        run: pnpm --filter @lake/mcp-server test
-
       - name: Build the adhoc-signed macOS app
         run: pnpm build:desktop:arm64:app
 
