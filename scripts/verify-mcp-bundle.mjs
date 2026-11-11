@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { access } from "node:fs/promises";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = resolve(new URL("..", import.meta.url).pathname);
+const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const serverDirectory = process.argv[2]
   ? resolve(process.argv[2])
   : resolve(root, "apps/desktop/src-tauri/target/release/bundle/macos/Lake Catch.app/Contents/Resources/mcp-server");
@@ -52,13 +53,16 @@ child.stderr.on("data", (chunk) => { errorOutput += chunk.toString("utf8"); });
 function request(method, params = {}) {
   const id = nextId++;
   const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id, method, params }), "utf8");
-  child.stdin.write(`${body.toString("utf8")}\n`);
   return new Promise((resolveResponse, reject) => {
-    const timer = setTimeout(() => reject(new Error(`timed out waiting for ${method}`)), 5000);
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(`timed out waiting for ${method}`));
+    }, 5000);
     pending.set(id, (response) => {
       clearTimeout(timer);
       resolveResponse(response);
     });
+    child.stdin.write(`${body.toString("utf8")}\n`);
   });
 }
 
