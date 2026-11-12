@@ -1,6 +1,8 @@
 # Lake Catch
 
-Lake Catch 是一个 macOS 桌面应用，用于打开设计页面、同步设计数据，并通过本地 MCP 提供给 Codex 等 AI 工具使用。
+Lake Catch 是一个帮助 AI 将蓝湖设计稿转换为具体代码的 macOS 桌面应用。它可以打开并同步蓝湖设计稿，提取页面结构、图层、样式、标注、视觉预览和可用资源，再通过本地 MCP 提供给 Codex 等 AI 工具。
+
+连接 MCP 后，可以直接让 AI 根据当前整张设计稿或选中的局部区域生成目标平台代码，例如 Android Jetpack Compose、Android XML、iOS SwiftUI、UIKit、React 等。Lake Catch 负责提供设计上下文，具体代码由用户连接的 AI 工具在目标项目中生成。
 
 ## 普通用户使用
 
