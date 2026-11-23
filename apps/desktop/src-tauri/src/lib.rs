@@ -17,7 +17,7 @@ use url::Url;
 #[cfg(target_os = "macos")]
 use block2::RcBlock;
 #[cfg(target_os = "macos")]
-use objc2_foundation::{MainThreadMarker, NSArray, NSHTTPCookie, NSUUID};
+use objc2_foundation::{MainThreadMarker, NSArray, NSDate, NSHTTPCookie, NSUUID};
 #[cfg(target_os = "macos")]
 use objc2_web_kit::WKWebsiteDataStore;
 
@@ -1131,6 +1131,52 @@ async fn get_lake_session(app: tauri::AppHandle) -> Result<LakeSession, String> 
     serde_json::from_value(value).map_err(|_| "Lake 会话结果格式无效".to_string())
 }
 
+// The official web client authenticates API calls with token as the Basic
+// username and an empty password. A custom `token` header is ignored by this API.
+fn lake_api_authorization(token: Option<&str>) -> Option<String> {
+    token
+        .filter(|value| !value.trim().is_empty())
+        .map(|token| format!("Basic {}", BASE64_STANDARD.encode(format!("{token}:"))))
+}
+
+// eval_with_callback serializes JavaScript strings as JSON strings. Parsing
+// JSON.stringify(...) once therefore yields a String, not the response object.
+fn browser_callback_value(payload: &str) -> Result<serde_json::Value, serde_json::Error> {
+    match serde_json::from_str(payload)? {
+        serde_json::Value::String(serialized) => serde_json::from_str(&serialized),
+        value => Ok(value),
+    }
+}
+
+fn lake_browser_api_scripts(request_key: &str, endpoint: &Url) -> Result<(String, String), String> {
+    let request_key_literal = serde_json::to_string(&request_key)
+        .map_err(|error| format!("生成浏览器 API 请求标识失败：{error}"))?;
+    let endpoint_literal = serde_json::to_string(endpoint.as_str())
+        .map_err(|error| format!("生成浏览器 API 请求失败：{error}"))?;
+    let script = format!(
+        r#"(() => {{
+          const key = {request_key_literal};
+          const endpoint = {endpoint_literal};
+          window[key] = {{ pending: true }};
+          (async () => {{
+            try {{
+              const token = localStorage.getItem('token') || localStorage.getItem('access_token') || localStorage.getItem('accessToken') || '';
+              const headers = {{ 'Accept': 'application/json, text/plain, */*', 'X-Requested-With': 'XMLHttpRequest' }};
+              if (token) headers.Authorization = 'Basic ' + btoa(token + ':');
+              const response = await fetch(endpoint, {{ credentials: 'include', headers }});
+              window[key] = {{ status: response.status, body: await response.text() }};
+            }} catch (error) {{
+              window[key] = {{ error: String(error) }};
+            }}
+          }})();
+        }})()"#,
+        request_key_literal = request_key_literal,
+        endpoint_literal = endpoint_literal,
+    );
+    let read_script = format!("JSON.stringify(window[{request_key_literal}] || null)");
+    Ok((script, read_script))
+}
+
 async fn fetch_lake_api_in_browser(
     app: &tauri::AppHandle,
     endpoint: &Url,
@@ -1145,41 +1191,15 @@ async fn fetch_lake_api_in_browser(
             .map(|duration| duration.as_nanos())
             .unwrap_or_default()
     );
-    let endpoint_literal = serde_json::to_string(endpoint.as_str())
-        .map_err(|error| format!("生成浏览器 API 请求失败：{error}"))?;
-    let script = format!(
-        r#"(() => {{
-          const key = {request_key:?};
-          const endpoint = {endpoint_literal};
-          window[key] = {{ pending: true }};
-          (async () => {{
-            try {{
-              const token = localStorage.getItem('token') || localStorage.getItem('access_token') || localStorage.getItem('accessToken') || '';
-              const headers = {{ 'Accept': 'application/json, text/plain, */*', 'X-Requested-With': 'XMLHttpRequest' }};
-              if (token) headers.token = token;
-              const response = await fetch(endpoint, {{ credentials: 'include', headers }});
-              window[key] = {{ status: response.status, body: await response.text() }};
-            }} catch (error) {{
-              window[key] = {{ error: String(error) }};
-            }}
-          }})();
-        }})()"#,
-        request_key = serde_json::to_string(&request_key)
-            .map_err(|error| format!("生成浏览器 API 请求标识失败：{error}"))?,
-        endpoint_literal = endpoint_literal,
-    );
+    let (script, read_script) = lake_browser_api_scripts(&request_key, endpoint)?;
     webview
         .eval(&script)
         .map_err(|error| format!("启动浏览器 API 请求失败：{error}"))?;
 
     for _ in 0..80 {
         let (sender, receiver) = mpsc::channel();
-        let read_script = format!(
-            "JSON.stringify(window[{request_key:?}] || null)",
-            request_key = request_key
-        );
         webview
-            .eval_with_callback(read_script, move |value| {
+            .eval_with_callback(&read_script, move |value| {
                 let _ = sender.send(value);
             })
             .map_err(|error| format!("读取浏览器 API 响应失败：{error}"))?;
@@ -1191,14 +1211,12 @@ async fn fetch_lake_api_in_browser(
         let Ok(callback_value) = callback_value else {
             continue;
         };
-        let value: serde_json::Value = serde_json::from_str(&callback_value)
-            .or_else(|_| {
-                serde_json::from_str(
-                    &serde_json::from_str::<String>(&callback_value).unwrap_or_default(),
-                )
-            })
+        let value: serde_json::Value = browser_callback_value(&callback_value)
             .map_err(|error| format!("解析浏览器 API 响应失败：{error}"))?;
-        if value.get("pending").and_then(serde_json::Value::as_bool) == Some(true) {
+        if value.is_null()
+            || value.get("pending").and_then(serde_json::Value::as_bool) == Some(true)
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         }
         if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
@@ -1258,7 +1276,7 @@ async fn fetch_preview_in_browser(
         .map_err(|error| format!("生成浏览器预览图请求失败：{error}"))?;
     let script = format!(
         r#"(() => {{
-          const key = {request_key:?};
+          const key = {request_key};
           const url = {url_literal};
           window[key] = {{ pending: true }};
           (async () => {{
@@ -1301,14 +1319,12 @@ async fn fetch_preview_in_browser(
         let Ok(callback_value) = callback_value else {
             continue;
         };
-        let value: serde_json::Value = serde_json::from_str(&callback_value)
-            .or_else(|_| {
-                serde_json::from_str(
-                    &serde_json::from_str::<String>(&callback_value).unwrap_or_default(),
-                )
-            })
+        let value: serde_json::Value = browser_callback_value(&callback_value)
             .map_err(|error| format!("解析浏览器预览图响应失败：{error}"))?;
-        if value.get("pending").and_then(serde_json::Value::as_bool) == Some(true) {
+        if value.is_null()
+            || value.get("pending").and_then(serde_json::Value::as_bool) == Some(true)
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         }
         if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
@@ -1643,31 +1659,15 @@ async fn fetch_lake_design_data(
     {
         request = request.header(reqwest::header::COOKIE, cookies);
     }
-    if let Some(token) = session
-        .token
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        request = request.header("token", token);
+    if let Some(authorization) = lake_api_authorization(session.token.as_deref()) {
+        request = request.header(reqwest::header::AUTHORIZATION, authorization);
     }
-    let mut response = None;
-    for attempt in 0..3 {
-        let current = request
-            .try_clone()
-            .ok_or_else(|| "API 请求无法重试".to_string())?
-            .send()
-            .await
-            .map_err(|error| format!("api-requested 阶段失败：{error}"))?;
-        if current.status().as_u16() == 418 && attempt < 2 {
-            tokio::time::sleep(Duration::from_millis(700 * (attempt + 1))).await;
-            continue;
-        }
-        response = Some(current);
-        break;
-    }
-    let response = response.ok_or_else(|| "api-requested 阶段失败".to_string())?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("api-requested 阶段失败：{error}"))?;
     let native_http_status = response.status().as_u16();
-    let (http_status, body) = if native_http_status == 418 {
+    let (http_status, body) = if matches!(native_http_status, 401 | 403 | 418) {
         match fetch_lake_api_in_browser(&app, &endpoint).await {
             Ok(Some((browser_status, browser_body))) => (browser_status, browser_body),
             Ok(None) => (
@@ -1682,7 +1682,7 @@ async fn fetch_lake_design_data(
                     format!("api-response-received 阶段失败：{read_error}")
                 })?;
                 return Err(format!(
-                    "api-response-received 阶段失败：HTTP 418；浏览器会话重试失败：{error}；服务端响应：{}",
+                    "api-response-received 阶段失败：HTTP {native_http_status}；浏览器会话重试失败：{error}；服务端响应：{}",
                     native_body.chars().take(240).collect::<String>()
                 ));
             }
@@ -1700,6 +1700,16 @@ async fn fetch_lake_design_data(
         return Err("credentials-read 阶段失败：当前登录态无权访问此设计稿".to_string());
     }
     if !(200..300).contains(&http_status) {
+        if http_status == 418
+            && body
+                .to_ascii_lowercase()
+                .contains("permission to access this project")
+        {
+            return Err(
+                "credentials-read 阶段失败：HTTP 418，服务端拒绝访问此项目；请核对当前登录账号、团队与设计稿权限"
+                    .to_string(),
+            );
+        }
         return Err(format!(
             "api-response-received 阶段失败：HTTP {http_status}"
         ));
@@ -2332,9 +2342,51 @@ fn navigate_lanhu_browser(app: tauri::AppHandle, url: String) -> Result<(), Stri
         .map_err(|error| format!("导航到 Lake 页面失败：{error}"))
 }
 
+#[cfg(target_os = "macos")]
+async fn clear_lake_data_store(app: &tauri::AppHandle) -> Result<(), String> {
+    let (sender, receiver) = mpsc::channel();
+    let data_store_identifier = LAKE_DATA_STORE_IDENTIFIER;
+    app.run_on_main_thread(move || {
+        let Some(main_thread) = MainThreadMarker::new() else {
+            let _ = sender.send(Err("无法获取 macOS 主线程标记".to_string()));
+            return;
+        };
+        let data_types = unsafe { WKWebsiteDataStore::allWebsiteDataTypes(main_thread) };
+        let data_store = unsafe {
+            WKWebsiteDataStore::dataStoreForIdentifier(
+                &NSUUID::from_bytes(data_store_identifier),
+                main_thread,
+            )
+        };
+        let since = NSDate::dateWithTimeIntervalSince1970(0.0);
+        let callback = RcBlock::new(move || {
+            let _ = sender.send(Ok(()));
+        });
+        unsafe {
+            data_store.removeDataOfTypes_modifiedSince_completionHandler(
+                &data_types,
+                &since,
+                &callback,
+            );
+        }
+    })
+    .map_err(|error| format!("启动 WebKit 登录数据清理失败：{error}"))?;
+
+    tauri::async_runtime::spawn_blocking(move || receiver.recv_timeout(Duration::from_secs(10)))
+        .await
+        .map_err(|error| format!("等待 WebKit 登录数据清理任务失败：{error}"))?
+        .map_err(|_| "等待 WebKit 登录数据清理超时".to_string())?
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn clear_lake_data_store(_app: &tauri::AppHandle) -> Result<(), String> {
+    Ok(())
+}
+
 #[tauri::command]
-fn clear_lanhu_session(app: tauri::AppHandle) -> Result<(), String> {
+async fn clear_lanhu_session(app: tauri::AppHandle) -> Result<(), String> {
     let Some(webview) = app.get_webview("lanhu-browser") else {
+        clear_lake_data_store(&app).await?;
         return Ok(());
     };
     // Clear origin-local state immediately as well. This covers auth flows
@@ -2343,9 +2395,18 @@ fn clear_lanhu_session(app: tauri::AppHandle) -> Result<(), String> {
     webview
         .eval("try { localStorage.clear(); sessionStorage.clear(); } catch (_) {}")
         .map_err(|error| format!("清除 Lake 页面存储失败：{error}"))?;
+    for cookie in webview
+        .cookies()
+        .map_err(|error| format!("读取 Lake Cookie 失败：{error}"))?
+    {
+        webview
+            .delete_cookie(cookie)
+            .map_err(|error| format!("删除 Lake Cookie 失败：{error}"))?;
+    }
     webview
         .clear_all_browsing_data()
         .map_err(|error| format!("清除 Lake 登录状态失败：{error}"))?;
+    clear_lake_data_store(&app).await?;
     webview
         .close()
         .map_err(|error| format!("关闭 Lake 页面窗口失败：{error}"))
@@ -2970,6 +3031,49 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_authentication_matches_official_basic_auth() {
+        assert_eq!(
+            lake_api_authorization(Some("test-token")),
+            Some("Basic dGVzdC10b2tlbjo=".into())
+        );
+        assert_eq!(lake_api_authorization(None), None);
+        assert_eq!(lake_api_authorization(Some("  ")), None);
+    }
+
+    #[test]
+    fn browser_callback_decodes_objects_and_stringified_results() {
+        let response = serde_json::json!({"status": 200, "body": "{\"code\":0}"});
+        let raw = serde_json::to_string(&response).unwrap();
+        let wrapped = serde_json::to_string(&raw).unwrap();
+        assert_eq!(browser_callback_value(&raw).unwrap(), response);
+        assert_eq!(browser_callback_value(&wrapped).unwrap(), response);
+        assert!(browser_callback_value("null").unwrap().is_null());
+        assert_eq!(
+            browser_callback_value("\"null\"").unwrap(),
+            serde_json::Value::Null
+        );
+        let pending = serde_json::to_string(r#"{"pending":true}"#).unwrap();
+        assert_eq!(browser_callback_value(&pending).unwrap()["pending"], true);
+        assert!(browser_callback_value("invalid").is_err());
+    }
+
+    #[test]
+    fn browser_api_scripts_use_the_same_unescaped_request_key() {
+        let endpoint = Url::parse("https://lanhuapp.com/api/project/image?pid=project").unwrap();
+        let (request_script, read_script) =
+            lake_browser_api_scripts("__lakeApiRequest_test", &endpoint).unwrap();
+
+        assert!(request_script.contains("headers.Authorization = 'Basic ' + btoa(token + ':')"));
+        assert!(!request_script.contains("headers.token"));
+        assert!(request_script.contains("const key = \"__lakeApiRequest_test\";"));
+        assert!(!request_script.contains("\\\"__lakeApiRequest_test\\\""));
+        assert_eq!(
+            read_script,
+            "JSON.stringify(window[\"__lakeApiRequest_test\"] || null)"
+        );
+    }
 
     #[test]
     fn extracts_nested_layers_styles_and_assets() {

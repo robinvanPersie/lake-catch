@@ -1269,7 +1269,15 @@ export default function App() {
     try {
       await invoke("clear_lanhu_session");
       setBrowserOpened(false);
-      setStatus("Lake 登录状态已清除，下次打开可重新登录");
+      setPageUrl(lakeHomeUrl);
+      setOpenedUrl(lakeHomeUrl);
+      setLastBrowserUrlSyncAt(null);
+      try {
+        localStorage.removeItem(lastOpenedUrlKey);
+      } catch {
+        // The session is still cleared even if browser storage is unavailable.
+      }
+      setStatus("Lake 登录状态已清除，下次将从 Lake 首页重新登录");
     } catch (error) {
       setStatus(`清除 Lake 登录状态失败：${error instanceof Error ? error.message : String(error)}`);
     }
