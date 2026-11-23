@@ -691,6 +691,21 @@ export default function App() {
       setStatus(`结构化探针失败，已保留页面快照：${message}`);
     }
 
+    // Read selection after the diagnostic probes, immediately before the API
+    // request. Group tabs can switch designs while keeping location.href fixed.
+    try {
+      const selection = await invoke<{ url: string; title: string } | null>("get_lanhu_browser_selection");
+      if (selection) {
+        currentUrl = selection.url;
+        currentTitle = selection.title;
+        pageSnapshot = { ...pageSnapshot, url: currentUrl, title: currentTitle };
+      }
+    } catch (error) {
+      setStatus(`同步失败：无法确认当前设计稿，${String(error)}`);
+      setIsSyncing(false);
+      return;
+    }
+
     if (!currentUrl) {
       setStatus("同步失败：请先输入 Lake 页面地址");
       setIsSyncing(false);

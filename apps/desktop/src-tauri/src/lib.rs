@@ -101,7 +101,7 @@ struct LakeRoute {
     project_id: Option<String>,
     image_id: Option<String>,
     team_id: Option<String>,
-    child: Option<String>,
+    version_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -155,18 +155,24 @@ fn lake_route(raw: &str) -> Result<LakeRoute, String> {
         .or_else(|| url.query())
         .unwrap_or_default();
     let mut route = LakeRoute::default();
+    let mut child_id = None;
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         match key.as_ref() {
             "pid" | "project_id" => route.project_id = Some(value.into_owned()),
             "image_id" | "docId" => route.image_id = Some(value.into_owned()),
             "tid" | "team_id" => route.team_id = Some(value.into_owned()),
-            // Detail pages use both names depending on how the page was
-            // opened. Omitting childImg makes the API fall back to another
-            // artboard in the same project, which produces a valid but wrong
-            // preview.
-            "child" | "childImg" | "child_img" => route.child = Some(value.into_owned()),
+            "child" => child_id = Some(value.into_owned()),
+            "version_id" => route.version_id = Some(value.into_owned()),
+            // childImg is an index into the parent's group, not an image ID.
+            // The browser selection probe resolves it before synchronization.
+            "childImg" | "child_img" => {
+                return Err("当前链接包含子稿索引，请等待页面加载后读取当前设计稿".into());
+            }
             _ => {}
         }
+    }
+    if let Some(id) = child_id {
+        route.image_id = Some(id);
     }
     if route.project_id.is_none() {
         return Err("当前页面 URL 缺少项目 ID（pid/project_id）".to_string());
@@ -192,9 +198,6 @@ fn lake_api_url(route: &LakeRoute) -> Result<Url, String> {
         query.append_pair("comment", "1");
         if let Some(team_id) = route.team_id.as_deref() {
             query.append_pair("team_id", team_id);
-        }
-        if let Some(child) = route.child.as_deref() {
-            query.append_pair("child", child);
         }
     }
     Ok(endpoint)
@@ -225,6 +228,23 @@ fn json_url(value: &serde_json::Value) -> Option<String> {
         }
     }
     walk(value)
+}
+
+fn selected_design_version<'a>(
+    data: &'a serde_json::Value,
+    version_id: Option<&str>,
+) -> Result<&'a serde_json::Value, String> {
+    let versions = data.get("versions").and_then(serde_json::Value::as_array);
+    if let Some(id) = version_id {
+        return versions
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("id").and_then(serde_json::Value::as_str) == Some(id))
+            })
+            .ok_or_else(|| "当前选择的设计稿版本已变化，请重新同步".to_string());
+    }
+    Ok(versions.and_then(|items| items.first()).unwrap_or(data))
 }
 
 fn normalize_json_url(raw: &str) -> Result<Url, String> {
@@ -261,9 +281,14 @@ fn raw_design_json_file(app: &tauri::AppHandle, route: &LakeRoute) -> Result<Pat
             .collect::<String>()
     };
     Ok(directory.join(format!(
-        "{}-{}.json",
+        "{}-{}{}.json",
         safe(route.project_id.as_deref(), "project"),
-        safe(route.image_id.as_deref(), "image")
+        safe(route.image_id.as_deref(), "image"),
+        route
+            .version_id
+            .as_deref()
+            .map(|id| format!("-{}", safe(Some(id), "version")))
+            .unwrap_or_default()
     )))
 }
 
@@ -288,9 +313,14 @@ fn preview_file(app: &tauri::AppHandle, route: &LakeRoute) -> Result<PathBuf, St
             .collect::<String>()
     };
     Ok(directory.join(format!(
-        "{}-{}.png",
+        "{}-{}{}.png",
         safe(route.project_id.as_deref(), "project"),
-        safe(route.image_id.as_deref(), "image")
+        safe(route.image_id.as_deref(), "image"),
+        route
+            .version_id
+            .as_deref()
+            .map(|id| format!("-{}", safe(Some(id), "version")))
+            .unwrap_or_default()
     )))
 }
 
@@ -1727,8 +1757,9 @@ async fn fetch_lake_design_data(
         }
     }
     let data = response_data(&value);
-    let preview_url = official_preview_url(data);
-    let raw_json_url = json_url(data)
+    let selected_version = selected_design_version(data, route.version_id.as_deref())?;
+    let preview_url = official_preview_url(selected_version);
+    let raw_json_url = json_url(selected_version)
         .ok_or_else(|| "json-url-found 阶段失败：API 响应中没有 json_url".to_string())?;
     let json_endpoint = normalize_json_url(&raw_json_url)?;
     let mut json_request = client.get(json_endpoint.clone());
@@ -2235,32 +2266,51 @@ fn cleanup_asset_cache(
     })
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct LakeDesignSelection {
+    url: String,
+    title: String,
+}
+
 #[tauri::command]
-async fn get_lanhu_browser_url(app: tauri::AppHandle) -> Result<Option<String>, String> {
+async fn get_lanhu_browser_selection(
+    app: tauri::AppHandle,
+) -> Result<Option<LakeDesignSelection>, String> {
     let Some(webview) = app.get_webview("lanhu-browser") else {
         return Ok(None);
     };
-
-    // Lake is a single-page application. Its design switcher can update the
-    // hash/history without a native WebView navigation, so WebviewWindow::url
-    // may remain stale. Read the URL from the page itself instead.
     let (sender, receiver) = mpsc::channel();
+    // Return errors as data: WebKit callbacks do not reliably surface thrown JS errors.
+    let script = format!(
+        "(() => {{ try {{ return JSON.stringify({}); }} catch (error) {{ return JSON.stringify({{error: String(error.message || error)}}); }} }})()",
+        include_str!("design-selection.js").trim()
+    );
     webview
-        .eval_with_callback("window.location.href", move |value| {
+        .eval_with_callback(script, move |value| {
             let _ = sender.send(value);
         })
         .map_err(|error| error.to_string())?;
     let payload =
         tauri::async_runtime::spawn_blocking(move || receiver.recv_timeout(Duration::from_secs(2)))
             .await
-            .map_err(|error| format!("读取 Lake 页面地址任务失败：{error}"))?
-            .map_err(|error| format!("读取 Lake 页面地址超时：{error}"))?;
-    let value: serde_json::Value = serde_json::from_str(&payload)
-        .or_else(|_| {
-            serde_json::from_str(&serde_json::from_str::<String>(&payload).unwrap_or_default())
-        })
-        .map_err(|error| format!("解析 Lake 页面地址失败：{error}"))?;
-    Ok(value.as_str().map(str::to_string))
+            .map_err(|error| format!("读取当前设计稿任务失败：{error}"))?
+            .map_err(|error| format!("读取当前设计稿超时：{error}"))?;
+    let value =
+        browser_callback_value(&payload).map_err(|error| format!("解析当前设计稿失败：{error}"))?;
+    if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+        return Err(error.to_string());
+    }
+    let selection: LakeDesignSelection =
+        serde_json::from_value(value).map_err(|error| format!("解析当前设计稿失败：{error}"))?;
+    validate_lake_url(&selection.url)?;
+    Ok(Some(selection))
+}
+
+#[tauri::command]
+async fn get_lanhu_browser_url(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    Ok(get_lanhu_browser_selection(app)
+        .await?
+        .map(|selection| selection.url))
 }
 
 fn validate_lake_url(raw: &str) -> Result<Url, String> {
@@ -3015,6 +3065,7 @@ pub fn run() {
             copy_text_to_clipboard,
             cleanup_asset_cache,
             get_lanhu_browser_url,
+            get_lanhu_browser_selection,
             open_lanhu_browser,
             focus_lanhu_browser,
             navigate_lanhu_browser,
@@ -3031,6 +3082,56 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_id_is_resolved_independently_of_query_order() {
+        for query in [
+            "image_id=parent&child=child-id",
+            "child=child-id&image_id=parent",
+        ] {
+            let route = lake_route(&format!(
+                "https://lanhuapp.com/web/#/item/project/detailDetach?pid=p&{query}&version_id=v2"
+            ))
+            .unwrap();
+            assert_eq!(route.image_id.as_deref(), Some("child-id"));
+            assert_eq!(route.version_id.as_deref(), Some("v2"));
+            let endpoint = lake_api_url(&route).unwrap();
+            assert!(endpoint
+                .query_pairs()
+                .any(|(key, value)| key == "image_id" && value == "child-id"));
+            assert!(!endpoint.query_pairs().any(|(key, _)| key == "child"));
+        }
+        assert!(lake_route(
+            "https://lanhuapp.com/web/#/item/project/detailDetach?pid=p&image_id=parent&childImg=0"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn selected_version_controls_both_json_and_preview() {
+        let data = serde_json::json!({
+            "json_url": "https://example.com/wrong.json",
+            "url": "https://example.com/wrong.png",
+            "versions": [
+                {"id": "latest", "json_url": "https://example.com/latest.json", "url": "https://example.com/latest.png"},
+                {"id": "older", "json_url": "https://example.com/older.json", "url": "https://example.com/older.png"}
+            ]
+        });
+        let selected = selected_design_version(&data, Some("older")).unwrap();
+        assert_eq!(
+            json_url(selected).as_deref(),
+            Some("https://example.com/older.json")
+        );
+        assert_eq!(
+            official_preview_url(selected).as_deref(),
+            Some("https://example.com/older.png")
+        );
+        assert_eq!(
+            selected_design_version(&data, None).unwrap()["id"],
+            "latest"
+        );
+        assert!(selected_design_version(&data, Some("deleted")).is_err());
+    }
 
     #[test]
     fn api_authentication_matches_official_basic_auth() {
