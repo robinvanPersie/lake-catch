@@ -1,6 +1,6 @@
 [package]
 name = "lake-catch"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lake Catch desktop shell"
 authors = ["Lake Catch"]
 edition = "2021"
